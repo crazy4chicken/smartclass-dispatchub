@@ -1013,7 +1013,7 @@ func TestIntegrationPhotosClaimResolve(t *testing.T) {
 	}
 	deferred, err := s.Photos.Get(ctx, futurePoll.ID)
 	if err != nil || deferred.Attempts != 4 || deferred.Status != domain.PhotoPending ||
-		deferred.NextPollAt == nil || !deferred.NextPollAt.Equal(now.Add(time.Minute)) {
+		deferred.NextPollAt == nil || !deferred.NextPollAt.Equal(now.Add(time.Minute).Truncate(time.Microsecond)) {
 		t.Fatalf("deferred photo = %+v, err %v", deferred, err)
 	}
 	claimedLater, err := s.Photos.ClaimPending(ctx, now.Add(2*time.Minute), 10)
