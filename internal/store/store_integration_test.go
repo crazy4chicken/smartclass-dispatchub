@@ -1028,9 +1028,19 @@ func TestIntegrationPhotosClaimResolve(t *testing.T) {
 	if err != nil || unresolved.Status != domain.PhotoUnresolved || unresolved.NextPollAt != nil {
 		t.Fatalf("unresolved photo = %+v, err %v", unresolved, err)
 	}
+	if leased, err := s.Photos.ClaimPending(ctx, now.Add(time.Minute), 10); err != nil || len(leased) != 0 {
+		t.Fatalf("ClaimPending(before the lease expires) = %d photos, err %v; want none", len(leased), err)
+	}
+	// The two rows claimed at the start and never resolved come back to the pool
+	// once their claim lease expires: that is the recovery path for a crash
+	// between claiming a photo and recording its outcome.
 	final, err := s.Photos.ClaimPending(ctx, now.Add(time.Hour), 10)
-	if err != nil || len(final) != 0 {
-		t.Fatalf("ClaimPending(after resolution) = %d photos, err %v; want none", len(final), err)
+	back := map[string]bool{}
+	for _, photo := range final {
+		back[photo.ID] = true
+	}
+	if err != nil || len(final) != 2 || !back[due2.ID] || !back[linked.ID] || back[futurePoll.ID] {
+		t.Fatalf("ClaimPending(after the lease expired) = %+v, err %v; want the two unresolved claims back", final, err)
 	}
 
 	if byRequest, err := s.Photos.ByRequestID(ctx, "req-3"); err != nil || byRequest.ID != futurePoll.ID {
