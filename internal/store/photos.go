@@ -90,10 +90,10 @@ func (p *Photos) ListBySession(ctx context.Context, sessionID string) ([]domain.
 func (p *Photos) ClaimPending(ctx context.Context, now time.Time, limit int) ([]domain.Photo, error) {
 	const query = `
 		UPDATE session_photos
-		SET next_poll_at = $1 + make_interval(secs => $2)
+		SET next_poll_at = $1::timestamptz + make_interval(secs => $2::double precision)
 		WHERE id IN (
 			SELECT id FROM session_photos
-			WHERE status = 'pending' AND (next_poll_at IS NULL OR next_poll_at <= $1)
+			WHERE status = 'pending' AND (next_poll_at IS NULL OR next_poll_at <= $1::timestamptz)
 			ORDER BY next_poll_at, id
 			LIMIT $3
 			FOR UPDATE SKIP LOCKED

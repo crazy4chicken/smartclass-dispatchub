@@ -165,13 +165,13 @@ func (s *Sessions) ClaimExpired(ctx context.Context, now time.Time, grace time.D
 		UPDATE sessions SET status = 'stopping', updated_at = now()
 		WHERE id IN (
 			SELECT id FROM sessions
-			WHERE status = 'recording' AND ends_at <= $2
+			WHERE status = 'recording' AND ends_at <= $1::timestamptz
 			ORDER BY ends_at, id
-			LIMIT $3
+			LIMIT $2
 			FOR UPDATE SKIP LOCKED
 		)
 		RETURNING ` + sessionColumns
-	return s.query(ctx, query, now, now.Add(-grace), claimBatchLimit(limit))
+	return s.query(ctx, query, now.Add(-grace), claimBatchLimit(limit))
 }
 
 // MarkRecording stores the upstream stream id and moves the session to
