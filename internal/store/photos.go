@@ -25,8 +25,10 @@ const photoColumns = `id, session_id, room_code, device_id, camera_enum, request
 // lease only stops a crash between claim and outcome from hot-looping.
 const photoClaimLease = 5 * time.Minute
 
-// Create inserts one photo row. A missing id, status, taken_at or next_poll_at
-// is filled in; the stored row is returned.
+// Create inserts one photo row. A missing id, status or taken_at is filled in;
+// next_poll_at is left NULL for a pending row, which the claim query treats as
+// due immediately — a freshly captured photo must be pollable on the next
+// resolver pass, not only once that pass's clock catches up with this insert.
 func (p *Photos) Create(ctx context.Context, photo domain.Photo) (domain.Photo, error) {
 	if photo.ID == "" {
 		photo.ID = id.New()
@@ -37,10 +39,6 @@ func (p *Photos) Create(ctx context.Context, photo domain.Photo) (domain.Photo, 
 	}
 	if photo.Status == "" {
 		photo.Status = domain.PhotoPending
-	}
-	if photo.NextPollAt == nil && photo.Status == domain.PhotoPending {
-		next := now
-		photo.NextPollAt = &next
 	}
 
 	const query = `
@@ -94,7 +92,7 @@ func (p *Photos) ClaimPending(ctx context.Context, now time.Time, limit int) ([]
 		WHERE id IN (
 			SELECT id FROM session_photos
 			WHERE status = 'pending' AND (next_poll_at IS NULL OR next_poll_at <= $1::timestamptz)
-			ORDER BY next_poll_at, id
+			ORDER BY next_poll_at ASC NULLS FIRST, id
 			LIMIT $3
 			FOR UPDATE SKIP LOCKED
 		)
