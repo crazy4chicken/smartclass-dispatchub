@@ -1,0 +1,22 @@
+# Build output
+/dispatchub
+/dispatchub.exe
+/bin/
+/dist/
+
+# Go test and coverage artifacts
+*.test
+*.out
+coverage.txt
+
+# Docs site
+node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+docs/public/openapi.yaml
+
+# Local tooling
+*.local
+.env
+.env.*
+!.env.example
