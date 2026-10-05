@@ -24,6 +24,14 @@ type dbtx interface {
 // Row is one scannable result row.
 type Row = pgx.Row
 
+// Schema is the PostgreSQL schema every dispatchub object lives in. The name
+// is fixed to the project and is not configurable: the pool pins search_path to
+// it, so the service never creates anything in the database's public schema,
+// which PostgreSQL 15 and newer reserves behind an explicit grant. A DSN that
+// pins search_path itself overrides it — the integration tests use that to run
+// against a throwaway schema.
+const Schema = "smartclass_dispatchub"
+
 // Store is the pgx-backed persistence layer. The typed sub-stores are
 // assembled by Open and share its pool.
 type Store struct {
@@ -36,10 +44,16 @@ type Store struct {
 	Sessions *Sessions
 	Photos   *Photos
 	Commands *Commands
+
+	// ownsSchema is true when the DSN left search_path alone, so Schema is this
+	// service's to create: Migrate creates it before goose runs. A DSN that
+	// pins its own search_path owns that schema instead.
+	ownsSchema bool
 }
 
 // Open connects to PostgreSQL, verifies the connection and assembles the typed
-// sub-stores. The connection reports application_name=smartclass-dispatchub.
+// sub-stores. The connection reports application_name=smartclass-dispatchub and
+// search_path=smartclass_dispatchub.
 func Open(ctx context.Context, dsn string) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
@@ -49,6 +63,10 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		cfg.ConnConfig.RuntimeParams = map[string]string{}
 	}
 	cfg.ConnConfig.RuntimeParams["application_name"] = "smartclass-dispatchub"
+	_, pinnedSchema := cfg.ConnConfig.RuntimeParams["search_path"]
+	if !pinnedSchema {
+		cfg.ConnConfig.RuntimeParams["search_path"] = Schema
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)
@@ -58,14 +76,15 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 	return &Store{
-		Pool:     pool,
-		Terms:    &Terms{db: pool},
-		Rooms:    &Rooms{db: pool},
-		Imports:  &Imports{db: pool},
-		Entries:  &Entries{db: pool},
-		Sessions: &Sessions{db: pool},
-		Photos:   &Photos{db: pool},
-		Commands: &Commands{db: pool},
+		Pool:       pool,
+		Terms:      &Terms{db: pool},
+		Rooms:      &Rooms{db: pool},
+		Imports:    &Imports{db: pool},
+		Entries:    &Entries{db: pool},
+		Sessions:   &Sessions{db: pool},
+		Photos:     &Photos{db: pool},
+		Commands:   &Commands{db: pool},
+		ownsSchema: !pinnedSchema,
 	}, nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/crazy4chicken/smartclass-dispatchub/migrations"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 )
@@ -19,7 +20,8 @@ const migrationLockKey int64 = 0x6e73632d64697370
 // Migrate applies every pending goose migration from the embedded FS behind a
 // session-level advisory lock, then logs the resulting schema version. It is
 // idempotent: a second call applies nothing and logs "no pending migrations".
-// The database itself is never created or dropped.
+// The database itself is never created or dropped; the project schema is
+// created when it is missing.
 func (s *Store) Migrate(ctx context.Context, logger *slog.Logger) error {
 	if logger == nil {
 		logger = slog.Default()
@@ -39,6 +41,24 @@ func (s *Store) Migrate(ctx context.Context, logger *slog.Logger) error {
 			logger.Warn("release migration lock", "error", err)
 		}
 	}()
+
+	// goose creates its version table before the first migration runs, and
+	// PostgreSQL cannot put objects in a schema that does not exist yet, so the
+	// project schema has to be there first. A role that owns the database has
+	// the CREATE privilege this needs; on a locked-down database a DBA creates
+	// the schema once and grants it, and this lookup leaves it alone.
+	if s.ownsSchema {
+		var exists bool
+		if err := conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)`, Schema).Scan(&exists); err != nil {
+			return fmt.Errorf("look up schema %s: %w", Schema, err)
+		}
+		if !exists {
+			if _, err := conn.Exec(ctx, `CREATE SCHEMA `+pgx.Identifier{Schema}.Sanitize()); err != nil {
+				return fmt.Errorf("create schema %s (the DSN role needs CREATE on the database, or a DBA creates the schema once and grants it): %w", Schema, err)
+			}
+			logger.Info("created schema", "schema", Schema)
+		}
+	}
 
 	// Closing the sql.DB does not close the pool it was opened from.
 	db := stdlib.OpenDBFromPool(s.Pool)

@@ -39,7 +39,8 @@ through the same API; every command is recorded for auditing.
 
 ## Requirements
 
-- PostgreSQL 16 or newer — dispatchub keeps its own tables and applies its migrations on startup.
+- PostgreSQL 16 or newer — dispatchub keeps its own tables in the `smartclass_dispatchub` schema
+  and applies its migrations on startup.
 - A `smartclass-webcam-server` instance with its devices provisioned.
 - A `teamusers` instance issuing your users' credentials and permission keys.
 - A Linux host running [svchost](https://github.com/crazy4chicken/nekostick-svchost) (or any

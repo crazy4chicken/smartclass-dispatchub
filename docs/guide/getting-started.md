@@ -14,7 +14,8 @@ replace teamusers with `DISPATCH_DEV=true`.
 
 - **Go 1.26 or newer** (build host only).
 - **PostgreSQL 16 or newer.** dispatchub owns one database and applies its embedded goose
-  migrations itself; no external migration tool is required.
+  migrations itself; no external migration tool is required. Everything it creates lives in the
+  `smartclass_dispatchub` schema, never in `public`.
 - **A teamusers instance.** Operators sign in there, and permission decisions are resolved against
   it on every request. The nine `dispatch:*` keys must be registered in its catalog; see
   [Permissions and access control](/guide/permissions).

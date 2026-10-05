@@ -156,7 +156,7 @@ and a `pnpm-workspace.yaml` carrying `allowBuilds: {esbuild: true}` plus the plu
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `DISPATCH_LISTEN_ADDR` | `:8081` | HTTP listen address. |
-| `DISPATCH_DSN` | — (required) | PostgreSQL DSN; `application_name=smartclass-dispatchub`. |
+| `DISPATCH_DSN` | — (required) | PostgreSQL DSN; `application_name=smartclass-dispatchub`, `search_path=smartclass_dispatchub` pinned by the pool. |
 | `DISPATCH_TIMEZONE` | `Asia/Shanghai` | Timezone used to turn `(date, period)` into instants. |
 | `DISPATCH_TEAMUSERS_URL` | — (required unless `DISPATCH_DEV=true`) | teamusers base URL; JWKS discovered under it. |
 | `DISPATCH_TEAMUSERS_ISSUER` | `teamusers` | Expected `iss`. |
@@ -220,7 +220,10 @@ the field stays null and `own`-scoped access degrades to `team`/`any` (see risk 
 ## 6. Data model (PostgreSQL, goose `migrations/0001_init.sql`)
 
 ULID `TEXT` primary keys, `TIMESTAMPTZ`, `JSONB` for raw/aux payloads, `snake_case`, partial indexes —
-matching webcam-server and nsc-filehouse DDL style.
+matching webcam-server and nsc-filehouse DDL style. Every object lives in the `smartclass_dispatchub`
+schema: the pool pins `search_path` to it and `Migrate` creates the schema when it is missing, so
+nothing is ever created in `public`, which PostgreSQL 15 and newer reserve behind an explicit grant.
+The migration SQL stays unqualified — the pinned `search_path` decides where the objects land.
 
 ```sql
 -- +goose Up

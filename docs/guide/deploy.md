@@ -12,7 +12,11 @@ addresses, ports and secrets, and dispatchub is deployed as a singleton schedule
 ## Prerequisites
 
 - **PostgreSQL 16 or newer**, reachable from the dispatchub launch. The service applies its
-  embedded goose migrations on startup; no external migration tool is needed.
+  embedded goose migrations on startup; no external migration tool is needed. Every object it
+  creates lives in the schema `smartclass_dispatchub`, which it creates on the first migrate, so
+  the DSN role needs no rights on the database's `public` schema. A role that does not own the
+  database cannot create a schema: a DBA creates it once and grants it, and dispatchub then uses
+  it as-is.
 - **A teamusers instance** with the nine `dispatch:*` keys registered and a service credential for
   dispatchub. See [Permissions and access control](/guide/permissions).
 - **A smartclass-webcam-server instance** with its devices provisioned and an nsc-filehouse (or
@@ -45,7 +49,7 @@ set, and real environment variables always win over it:
 | Variable | Default | Required | Purpose |
 | --- | --- | --- | --- |
 | `DISPATCH_LISTEN_ADDR` | `:8081` | No | HTTP listen address. |
-| `DISPATCH_DSN` | - | Yes | PostgreSQL DSN; the pool sets `application_name=smartclass-dispatchub`. |
+| `DISPATCH_DSN` | - | Yes | PostgreSQL DSN; the pool sets `application_name=smartclass-dispatchub` and pins `search_path` to the `smartclass_dispatchub` schema (a DSN that sets `search_path` itself wins). |
 | `DISPATCH_TIMEZONE` | `Asia/Shanghai` | No | Timezone used to turn `(date, period)` into instants. |
 | `DISPATCH_TEAMUSERS_URL` | - | Yes (unless `DISPATCH_DEV=true`) | teamusers base URL; JWKS is discovered under it. |
 | `DISPATCH_TEAMUSERS_ISSUER` | `teamusers` | No | Expected `iss` claim. |
