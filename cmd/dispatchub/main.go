@@ -19,6 +19,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	// Embed the IANA time zone database so DISPATCH_TIMEZONE resolves on hosts
+	// without system tzdata, such as a Windows development box or a scratch
+	// container. It costs roughly 400 KiB of binary size.
+	_ "time/tzdata"
 
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/config"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/httpapi"
@@ -84,6 +88,10 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "configuration error:", err)
 		return 2
 	}
+	if err := validateCommandConfig(command, cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "configuration error:", err)
+		return 2
+	}
 	logger := newLogger(cfg)
 
 	switch command {
@@ -102,6 +110,25 @@ func run(args []string) int {
 	// loaded, so the switch above always returns. This keeps the compiler
 	// happy if a command is ever added to only one of the two switches.
 	return 2
+}
+
+// validateCommandConfig enforces the runtime dependencies of one subcommand.
+// FromEnv has already rejected malformed values, so a command only refuses to
+// start over what it truly cannot run without: the server needs every endpoint
+// and credential, migrate needs the database and register-permissions needs the
+// teamusers base URL. status and doctor need none of them, because they report
+// a missing dependency as SKIP instead of failing.
+func validateCommandConfig(command string, cfg config.Config) error {
+	switch command {
+	case "run":
+		return cfg.ValidateServer()
+	case "migrate":
+		return cfg.ValidateDatabase()
+	case "register-permissions":
+		return cfg.ValidateTeamusers()
+	default:
+		return nil
+	}
 }
 
 // usage prints the subcommand summary.
@@ -325,12 +352,9 @@ func (c *checker) webcam(cfg config.Config, log *slog.Logger) {
 	c.pass("webcam", "reachable: "+cfg.WebcamURL)
 }
 
-// runRegisterPermissions upserts the dispatch:* catalog in teamusers.
+// runRegisterPermissions upserts the dispatch:* catalog in teamusers. The
+// teamusers base URL is guaranteed by validateCommandConfig.
 func runRegisterPermissions(cfg config.Config, log *slog.Logger, token string) int {
-	if strings.TrimSpace(cfg.TeamusersURL) == "" {
-		log.Error("invalid configuration", "error", config.EnvTeamusersURL+" is required to register permissions")
-		return 2
-	}
 	if strings.TrimSpace(token) == "" {
 		log.Error("invalid configuration", "error", "an admin bearer token is required (-token or "+envAdminToken+")")
 		return 2

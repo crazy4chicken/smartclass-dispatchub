@@ -49,15 +49,15 @@ set, and real environment variables always win over it:
 | Variable | Default | Required | Purpose |
 | --- | --- | --- | --- |
 | `DISPATCH_LISTEN_ADDR` | `:8081` | No | HTTP listen address. |
-| `DISPATCH_DSN` | - | Yes | PostgreSQL DSN; the pool sets `application_name=smartclass-dispatchub` and pins `search_path` to the `smartclass_dispatchub` schema (a DSN that sets `search_path` itself wins). |
+| `DISPATCH_DSN` | - | `run`, `migrate` | PostgreSQL DSN; the pool sets `application_name=smartclass-dispatchub` and pins `search_path` to the `smartclass_dispatchub` schema (a DSN that sets `search_path` itself wins). |
 | `DISPATCH_TIMEZONE` | `Asia/Shanghai` | No | Timezone used to turn `(date, period)` into instants. |
-| `DISPATCH_TEAMUSERS_URL` | - | Yes (unless `DISPATCH_DEV=true`) | teamusers base URL; JWKS is discovered under it. |
+| `DISPATCH_TEAMUSERS_URL` | - | `run` (unless `DISPATCH_DEV=true`), `register-permissions` | teamusers base URL; JWKS is discovered under it. |
 | `DISPATCH_TEAMUSERS_ISSUER` | `teamusers` | No | Expected `iss` claim. |
 | `DISPATCH_TEAMUSERS_AUD` | `teamusers` | No | Expected `aud` claim - set it to the fleet value (`nekostick`). |
-| `DISPATCH_TEAMUSERS_CLIENT_ID` | - | Yes (unless `DISPATCH_DEV=true`) | client-credentials credential id for outbound calls (webcam-server + permission lookups). |
-| `DISPATCH_TEAMUSERS_CLIENT_SECRET` | - | Yes (unless `DISPATCH_DEV=true`) | client-credentials secret. Treat as a secret. |
+| `DISPATCH_TEAMUSERS_CLIENT_ID` | - | `run` (unless `DISPATCH_DEV=true`) | client-credentials credential id for outbound calls (webcam-server + permission lookups). |
+| `DISPATCH_TEAMUSERS_CLIENT_SECRET` | - | `run` (unless `DISPATCH_DEV=true`) | client-credentials secret. Treat as a secret. |
 | `DISPATCH_TEAMUSERS_TIMEOUT` | `5s` | No | IAM HTTP timeout. |
-| `DISPATCH_WEBCAM_URL` | - | Yes (unless `DISPATCH_DEV=true`) | smartclass-webcam-server base URL, e.g. `http://webcam:8080`. |
+| `DISPATCH_WEBCAM_URL` | - | `run` (unless `DISPATCH_DEV=true`) | smartclass-webcam-server base URL, e.g. `http://webcam:8080`. |
 | `DISPATCH_WEBCAM_TIMEOUT` | `10s` | No | Outbound HTTP timeout. |
 | `DISPATCH_SCHED_TICK` | `30s` | No | Scheduler scan interval. |
 | `DISPATCH_PRESTART` | `2m` | No | How early a session's recording starts. |
@@ -71,12 +71,17 @@ set, and real environment variables always win over it:
 | `DISPATCH_DEV` | `false` | No | Dev bypass: synthetic claims, teamusers disabled. Local development only. |
 | `DISPATCH_LOG_LEVEL` | `info` | No | `slog` level: `debug`, `info`, `warn` or `error`. |
 | `DISPATCH_ENV_FILE` | - | No | Path to a `.env`-style file; loaded at startup only when set. |
+| `DISPATCH_TEAMUSERS_ADMIN_TOKEN` | - | `register-permissions` | teamusers admin bearer token; the `-token` flag wins. A secret. |
 
 `DISPATCH_*_TIMEOUT`, `DISPATCH_SCHED_TICK`, `DISPATCH_PRESTART`, `DISPATCH_POSTSTOP_GRACE`,
 `DISPATCH_MISS_GRACE`, `DISPATCH_PHOTO_POLL_INTERVAL` and `DISPATCH_PHOTO_POLL_TTL` accept Go
-duration syntax (`300ms`, `2m`, `1h`). `Validate()` fails fast on a missing required value, an
-unparsable duration, an unknown timezone or an unknown log level, so a bad compose edit surfaces at
-startup, not at the first lesson.
+duration syntax (`300ms`, `2m`, `1h`). Loading fails fast on an unparsable duration, an unknown
+timezone or an unknown log level, and each subcommand then enforces only the variables it uses -
+`run` every endpoint and credential above, `migrate` the DSN, `register-permissions` the teamusers
+URL and its admin token - so a bad compose edit surfaces at startup, not at the first lesson, and a
+one-off `migrate` or catalog registration is never blocked by the runtime endpoints. The binary
+embeds the IANA time zone database (`time/tzdata`), so `DISPATCH_TIMEZONE` resolves on a host that
+has no system tzdata - a Windows development box or a scratch container needs nothing extra.
 
 ## Fleet deployment (svchost)
 

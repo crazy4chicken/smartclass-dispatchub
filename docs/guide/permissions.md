@@ -115,10 +115,14 @@ A permission key must exist in teamusers' catalog before a role can carry it. Re
 once per deployment - either with the service subcommand:
 
 ```sh
-dispatchub register-permissions
+DISPATCH_TEAMUSERS_URL='http://127.0.0.1:8082' \
+DISPATCH_TEAMUSERS_ADMIN_TOKEN='<teamusers admin token>' \
+  dispatchub register-permissions
 ```
 
-which upserts each key with `POST /permissions/ {key, description, registered_by}`, or by hand:
+which needs those two variables alone - no database, no webcam-server endpoint and no service
+credential - and upserts each key with `POST /permissions/ {key, description, registered_by}`. The
+same registration by hand:
 
 ```sh
 TEAMUSERS_URL=http://127.0.0.1:8082

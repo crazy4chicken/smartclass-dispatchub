@@ -94,22 +94,63 @@ func TestFromEnvDefaults(t *testing.T) {
 	}
 }
 
-// TestFromEnvRequiresProductionSettings checks that a non-dev configuration
-// reports every missing required value at once.
-func TestFromEnvRequiresProductionSettings(t *testing.T) {
+// TestValidateServerRequiresProductionSettings checks that the server
+// validation reports every missing runtime value at once, while FromEnv - which
+// only rejects malformed values - accepts the same empty environment.
+func TestValidateServerRequiresProductionSettings(t *testing.T) {
 	clearEnv(t)
 
-	_, err := FromEnv()
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("FromEnv() error = %v, want an empty environment to parse", err)
+	}
+	err = cfg.ValidateServer()
 	if err == nil {
-		t.Fatalf("FromEnv() error = nil, want the missing required values")
+		t.Fatalf("ValidateServer() error = nil, want the missing required values")
 	}
 	for _, key := range []string{EnvDSN, EnvTeamusersURL, EnvTeamusersClientID, EnvTeamusersClientSecret, EnvWebcamURL} {
 		if !strings.Contains(err.Error(), key) {
-			t.Fatalf("FromEnv() error = %q, want it to name %s", err, key)
+			t.Fatalf("ValidateServer() error = %q, want it to name %s", err, key)
 		}
 	}
 	if !strings.Contains(err.Error(), EnvDev+"=true") {
-		t.Fatalf("FromEnv() error = %q, want it to mention the dev bypass", err)
+		t.Fatalf("ValidateServer() error = %q, want it to mention the dev bypass", err)
+	}
+}
+
+// TestValidateCommandRequirements pins the per-command presence checks: migrate
+// needs the database alone and register-permissions the teamusers base URL
+// alone, so a host that only migrates or only registers the catalog is never
+// asked for the endpoints and credentials of the other subcommands.
+func TestValidateCommandRequirements(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvDSN, "postgres://dispatch@db/dispatch")
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("FromEnv() error = %v, want nil", err)
+	}
+	if err := cfg.ValidateDatabase(); err != nil {
+		t.Fatalf("ValidateDatabase() with only %s set = %v, want nil", EnvDSN, err)
+	}
+	if err := cfg.ValidateTeamusers(); err == nil || !strings.Contains(err.Error(), EnvTeamusersURL) {
+		t.Fatalf("ValidateTeamusers() without %s = %v, want an error naming it", EnvTeamusersURL, err)
+	}
+	if err := cfg.ValidateServer(); err == nil {
+		t.Fatalf("ValidateServer() = nil, want the missing endpoints and credentials")
+	}
+
+	clearEnv(t)
+	t.Setenv(EnvTeamusersURL, "http://iam:8080")
+
+	if cfg, err = FromEnv(); err != nil {
+		t.Fatalf("FromEnv() error = %v, want nil", err)
+	}
+	if err := cfg.ValidateTeamusers(); err != nil {
+		t.Fatalf("ValidateTeamusers() with only %s set = %v, want nil", EnvTeamusersURL, err)
+	}
+	if err := cfg.ValidateDatabase(); err == nil || !strings.Contains(err.Error(), EnvDSN) {
+		t.Fatalf("ValidateDatabase() without %s = %v, want an error naming it", EnvDSN, err)
 	}
 }
 
@@ -132,6 +173,9 @@ func TestFromEnvDevBypass(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() on the dev config = %v, want nil", err)
+	}
+	if err := cfg.ValidateServer(); err != nil {
+		t.Fatalf("ValidateServer() on the dev config = %v, want the dev bypass to waive the endpoints", err)
 	}
 }
 

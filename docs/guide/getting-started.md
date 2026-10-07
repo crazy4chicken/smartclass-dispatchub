@@ -32,6 +32,11 @@ The subcommands are `run`, `migrate`, `status`, `doctor` and `register-permissio
 `status` prints the redacted configuration, and `doctor` runs the same checks with a 30-second
 timeout and exits non-zero when a check fails.
 
+Each subcommand requires only what it uses: `migrate` needs `DISPATCH_DSN`,
+`register-permissions` needs `DISPATCH_TEAMUSERS_URL` plus an admin token (`-token` or
+`DISPATCH_TEAMUSERS_ADMIN_TOKEN`), and `status` and `doctor` run against whatever is configured -
+they print `SKIP` for a dependency that is not.
+
 ## Configure
 
 The service reads everything from the environment (a `.env` file is loaded only when

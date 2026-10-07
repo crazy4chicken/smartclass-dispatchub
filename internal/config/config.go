@@ -88,7 +88,10 @@ type Config struct {
 
 // FromEnv loads the configuration: DISPATCH_ENV_FILE, when set, is read first,
 // then real environment variables win over the file, and defaults fill the
-// rest. The result is validated, so a nil error means a usable Config.
+// rest. The result is checked with Validate, so a nil error means every value
+// that is set is usable; the endpoints and credentials a subcommand needs are
+// enforced separately by ValidateServer, ValidateDatabase and
+// ValidateTeamusers.
 func FromEnv() (Config, error) {
 	if path := strings.TrimSpace(os.Getenv(EnvFile)); path != "" {
 		if err := loadEnvFile(path); err != nil {
@@ -155,16 +158,15 @@ func FromEnv() (Config, error) {
 	return cfg, nil
 }
 
-// Validate reports every missing required value, unparseable timezone or level
-// and nonsensical duration or count. Required endpoints and credentials are
-// enforced unless Dev is set, mirroring the webcam-server dev bypass.
+// Validate reports every malformed value: an unloadable timezone, an unknown
+// log level and nonsensical duration or count. It requires no endpoint and no
+// credential, because each subcommand needs a different subset of them:
+// ValidateServer, ValidateDatabase and ValidateTeamusers add those presence
+// checks.
 func (c Config) Validate() error {
 	var errs []error
 	if strings.TrimSpace(c.ListenAddr) == "" {
 		errs = append(errs, fmt.Errorf("%s must not be empty", EnvListenAddr))
-	}
-	if strings.TrimSpace(c.DSN) == "" {
-		errs = append(errs, fmt.Errorf("%s is required", EnvDSN))
 	}
 	if _, err := time.LoadLocation(c.Timezone); err != nil {
 		errs = append(errs, fmt.Errorf("%s: %w", EnvTimezone, err))
@@ -174,20 +176,6 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.TeamusersAudience) == "" {
 		errs = append(errs, fmt.Errorf("%s must not be empty", EnvTeamusersAud))
-	}
-	if !c.Dev {
-		if strings.TrimSpace(c.TeamusersURL) == "" {
-			errs = append(errs, fmt.Errorf("%s is required (or set %s=true)", EnvTeamusersURL, EnvDev))
-		}
-		if strings.TrimSpace(c.TeamusersClientID) == "" {
-			errs = append(errs, fmt.Errorf("%s is required (or set %s=true)", EnvTeamusersClientID, EnvDev))
-		}
-		if strings.TrimSpace(c.TeamusersClientSecret) == "" {
-			errs = append(errs, fmt.Errorf("%s is required (or set %s=true)", EnvTeamusersClientSecret, EnvDev))
-		}
-		if strings.TrimSpace(c.WebcamURL) == "" {
-			errs = append(errs, fmt.Errorf("%s is required (or set %s=true)", EnvWebcamURL, EnvDev))
-		}
 	}
 	if c.TeamusersTimeout <= 0 {
 		errs = append(errs, fmt.Errorf("%s must be positive", EnvTeamusersTimeout))
@@ -224,6 +212,55 @@ func (c Config) Validate() error {
 	}
 	if _, ok := parseLevel(c.LogLevel); !ok {
 		errs = append(errs, fmt.Errorf("%s: unknown level %q", EnvLogLevel, c.LogLevel))
+	}
+	return errors.Join(errs...)
+}
+
+// ValidateServer reports what `run` cannot start without: the parse-level
+// checks plus the database DSN and, unless Dev is set, the teamusers endpoint
+// and client credentials and the webcam-server endpoint. Dev waives the
+// endpoints and credentials, mirroring the webcam-server dev bypass.
+func (c Config) ValidateServer() error {
+	errs := []error{c.Validate()}
+	if strings.TrimSpace(c.DSN) == "" {
+		errs = append(errs, fmt.Errorf("%s is required", EnvDSN))
+	}
+	if !c.Dev {
+		if strings.TrimSpace(c.TeamusersURL) == "" {
+			errs = append(errs, fmt.Errorf("%s is required (or set %s=true)", EnvTeamusersURL, EnvDev))
+		}
+		if strings.TrimSpace(c.TeamusersClientID) == "" {
+			errs = append(errs, fmt.Errorf("%s is required (or set %s=true)", EnvTeamusersClientID, EnvDev))
+		}
+		if strings.TrimSpace(c.TeamusersClientSecret) == "" {
+			errs = append(errs, fmt.Errorf("%s is required (or set %s=true)", EnvTeamusersClientSecret, EnvDev))
+		}
+		if strings.TrimSpace(c.WebcamURL) == "" {
+			errs = append(errs, fmt.Errorf("%s is required (or set %s=true)", EnvWebcamURL, EnvDev))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// ValidateDatabase reports what `migrate` cannot run without: the parse-level
+// checks plus the DSN. Migrating touches the database alone, so the endpoints
+// and credentials the server uses are irrelevant.
+func (c Config) ValidateDatabase() error {
+	errs := []error{c.Validate()}
+	if strings.TrimSpace(c.DSN) == "" {
+		errs = append(errs, fmt.Errorf("%s is required", EnvDSN))
+	}
+	return errors.Join(errs...)
+}
+
+// ValidateTeamusers reports what `register-permissions` cannot run without:
+// the parse-level checks plus the teamusers base URL. Registration
+// authenticates with an admin bearer token, so the service client credentials
+// are not required.
+func (c Config) ValidateTeamusers() error {
+	errs := []error{c.Validate()}
+	if strings.TrimSpace(c.TeamusersURL) == "" {
+		errs = append(errs, fmt.Errorf("%s is required", EnvTeamusersURL))
 	}
 	return errors.Join(errs...)
 }
