@@ -97,7 +97,7 @@ Go 1.26.0, module `github.com/crazy4chicken/smartclass-dispatchub`, chi v5.3.2, 
 with hand-written SQL, ULID (`TEXT PRIMARY KEY`), goose migrations over `embed.FS`, `log/slog` JSON,
 RFC 9457 problem+json with a stable `detail` code, list envelope `{"items":[…]}`, env-var config with
 a per-service prefix, `cmd/<svc>` subcommands (`run|status|doctor|register-permissions`),
-GitHub Actions release producing `<service>_<version>_<arch>.zip`, and a VitePress documentation site
+GitHub Actions release producing `<service>_<version>_<platform>_<arch>.zip`, and a VitePress documentation site
 (`docs/`, pnpm, OpenAPI emitted by `cmd/genspec`) deployed to GitHub Pages by a `docs.yml` workflow.
 
 ---
@@ -745,9 +745,9 @@ Notes the deploy guide must state next to that example:
   referenced service's Host-assigned address, so no static port appears anywhere in the fleet; the
   target must be declared in the same global namespace (it is, above).
 - **The service name is the release contract.** `services.<name>` is the `serviceId`, so the release
-  workflow must publish `dispatchub_<version>_<arch>.zip` with the entry binary named exactly
-  `dispatchub` at the ZIP root, and the process CWD will be the service root rather than that
-  extraction directory.
+  workflow must publish `dispatchub_<version>_<platform>_<arch>.zip` for `linux`, `windows` and
+  `macos` with the entry binary named exactly `dispatchub` - `dispatchub.exe` on Windows - at the
+  ZIP root, and the process CWD will be the service root rather than that extraction directory.
 - **A dangling `${...@svc}` reference fails that service's sync.** Dropping the `filewarehouse` block
   means also dropping `WEBCAM_FILEHOUSE_URL`; an unresolvable service-name target is a sync failure,
   not a silent empty string. (The `nsc-filewarehouse` compose circulating in the fleet sets
@@ -829,8 +829,8 @@ no infrastructure running, `docs/.vitepress/dist` contains every §12 page plus 
 `openapi.yaml`, every route in §7 appears in the API reference, `guide/deploy.md` carries the compose
 example verbatim from the repo-root `svchost.compose.yaml`, and a push to `main` deploys the site.
 
-**M5 — Hardening & release.** `.env.example`, `release.yml` (linux/amd64+arm64, zip asset
-`dispatchub_<version>_<arch>.zip` with the `dispatchub` binary at the zip root), colocated unit tests
+**M5 — Hardening & release.** `.env.example`, `release.yml` (linux/windows/macos × amd64+arm64, zip assets
+`dispatchub_<version>_<platform>_<arch>.zip` with the `dispatchub` binary - `dispatchub.exe` on Windows - at the zip root), colocated unit tests
 (CSV/weeks/state machine) and an integration suite gated by `DISPATCH_TEST_PG` with a `httptest` fake
 webcam-server.
 *Acceptance:* tag push produces a release asset; `go test ./...` passes with the integration suite

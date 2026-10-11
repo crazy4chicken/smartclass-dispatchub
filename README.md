@@ -73,7 +73,8 @@ DISPATCH_WEBCAM_URL='https://webcam.example.com' \
 ```
 
 Releases are published automatically for `v*` tags as
-`dispatchub_<version>_<arch>.zip` (Linux `x64` and `arm64`), which is exactly what svchost expects.
+`dispatchub_<version>_<platform>_<arch>.zip` - `linux`, `windows` and `macos`, each on `x64` and
+`arm64` - which is exactly what svchost expects.
 
 ## Documentation
 

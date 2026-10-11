@@ -25,10 +25,11 @@ addresses, ports and secrets, and dispatchub is deployed as a singleton schedule
 
 ## Release artifact
 
-The release workflow publishes `dispatchub_<version>_<arch>.zip` for `linux/amd64` (`x64`) and
-`linux/arm64`, with the `dispatchub` binary at the ZIP root and nothing else. That layout is the
-svchost contract: `services.<name>` in the compose document is the service id, and the entry binary
-must carry the exact service name.
+The release workflow publishes `dispatchub_<version>_<platform>_<arch>.zip` for `linux`, `windows`
+and `macos`, each on `amd64` (`x64`) and `arm64`, with the entry binary at the ZIP root and nothing
+else - `dispatchub` on Linux and macOS, `dispatchub.exe` on Windows. That layout is the svchost
+contract: the asset name carries the service id, the platform and the architecture, and the entry
+binary must carry the exact service name.
 
 To build the same artifact locally:
 
@@ -225,8 +226,10 @@ svchost resolves three template forms inside `env` values:
   referenced service's Host-assigned address, so no static port appears anywhere in the fleet; the
   target must be declared in the same global namespace (it is, above).
 - **The service name is the release contract.** `services.<name>` is the `serviceId`, so the release
-  workflow must publish `dispatchub_<version>_<arch>.zip` with the entry binary named exactly
-  `dispatchub` at the ZIP root, and the process CWD will be the service root rather than that
+  workflow must publish `dispatchub_<version>_<platform>_<arch>.zip` for `linux`, `windows` and
+  `macos` (the 4-segment form - the platform segment is mandatory, and the legacy 3-segment name is
+  matched on Linux hosts only) with the entry binary named exactly `dispatchub` - `dispatchub.exe`
+  on Windows - at the ZIP root, and the process CWD will be the service root rather than that
   extraction directory.
 - **A dangling `${...@svc}` reference fails that service's sync.** Dropping the `filewarehouse` block
   means also dropping `WEBCAM_FILEHOUSE_URL`; an unresolvable service-name target is a sync failure,
@@ -300,7 +303,7 @@ svchost resolves three template forms inside `env` values:
 
 | Field | Note |
 | --- | --- |
-| `source.release` | `dispatchub_<version>_<arch>.zip`, binary `dispatchub`; the commented `path:` is the bootstrap route before the first release exists. |
+| `source.release` | `dispatchub_<version>_linux_<arch>.zip`, binary `dispatchub`; the commented `path:` is the bootstrap route before the first release exists. |
 | `DISPATCH_LISTEN_ADDR` | `${HOST}:${PORT}` - bind to the launch lease. |
 | `DISPATCH_DSN` | The dispatchub database DSN; migrations are applied from the embedded FS at startup. |
 | `DISPATCH_TIMEZONE` | Keep `Asia/Shanghai` unless the school's wall clock says otherwise; a wrong value schedules the whole term wrongly. |
