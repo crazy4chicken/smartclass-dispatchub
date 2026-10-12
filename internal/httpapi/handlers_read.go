@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/domain"
+	"github.com/crazy4chicken/smartclass-dispatchub/internal/filehouse"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/httpx"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/store"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/webcam"
@@ -224,19 +226,40 @@ type artifactPhoto struct {
 	DownloadURL string    `json:"download_url"`
 }
 
+// artifactMerge is the public view of a session's merge job. download_url is
+// minted per response by filehouse and never persisted, so it is absent while
+// the merge is not succeeded or while the URL could not be minted; the
+// object-storage coordinates stay in the database.
+type artifactMerge struct {
+	ID          string    `json:"id"`
+	SessionID   string    `json:"session_id"`
+	Status      string    `json:"status"`
+	JobID       *string   `json:"job_id,omitempty"`
+	DownloadURL string    `json:"download_url,omitempty"`
+	SizeBytes   *int64    `json:"size_bytes,omitempty"`
+	Attempts    int       `json:"attempts"`
+	LastError   *string   `json:"last_error,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 // artifactsResponse is the body of GET /api/v1/sessions/{id}/artifacts.
 // download_url never leaves webcam-server's 15-minute TTL, so it is fetched on
-// every call and never persisted.
+// every call and never persisted. Merge is the session's merge job and is
+// absent while no merge was ever enqueued.
 type artifactsResponse struct {
 	StreamID *string           `json:"stream_id,omitempty"`
 	Status   string            `json:"status"`
 	Segments []artifactSegment `json:"segments"`
 	Photos   []artifactPhoto   `json:"photos"`
+	Merge    *artifactMerge    `json:"merge,omitempty"`
 }
 
 // handleSessionArtifacts answers GET /api/v1/sessions/{id}/artifacts by
-// re-deriving the segment list from webcam-server and resolving every ledger
-// photo to a live download URL.
+// re-deriving the segment list from webcam-server, resolving every ledger
+// photo to a live download URL and attaching the session's merge job when one
+// exists. The merge lookup is best-effort: a failing ledger leaves the merge
+// object out instead of failing the call.
 func (s *server) handleSessionArtifacts(w http.ResponseWriter, r *http.Request) {
 	session, err := s.deps.Store.Sessions.Get(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
@@ -248,6 +271,17 @@ func (s *server) handleSessionArtifacts(w http.ResponseWriter, r *http.Request) 
 		Status:   session.Status,
 		Segments: []artifactSegment{},
 		Photos:   []artifactPhoto{},
+	}
+	if s.deps.Store.Merges != nil {
+		merge, err := s.deps.Store.Merges.GetBySession(r.Context(), session.ID)
+		switch {
+		case err == nil:
+			response.Merge = s.artifactMerge(r, merge)
+		case errors.Is(err, store.ErrNotFound):
+			// The session was never enqueued for merging; the field stays absent.
+		default:
+			s.log.Warn("merge lookup failed", "session_id", session.ID, "error", err)
+		}
 	}
 	client := s.deps.Webcam
 	if session.StreamID != nil && *session.StreamID != "" && client != nil {
@@ -296,6 +330,52 @@ func (s *server) handleSessionArtifacts(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, response)
+}
+
+// filehouseTimeout is the outbound deadline for minting a download URL,
+// falling back to a sane default when the effective config leaves it unset
+// (the generator builds Deps{}).
+func (s *server) filehouseTimeout() time.Duration {
+	if timeout := s.deps.Config.FilehouseTimeout; timeout > 0 {
+		return timeout
+	}
+	return 10 * time.Second
+}
+
+// artifactMerge maps a stored merge row to its public shape and mints the
+// merged video's download_url when the row succeeded, carries both storage
+// coordinates and a filehouse client is configured. Minting is best-effort: a
+// failure is logged and leaves the URL empty rather than failing the call.
+func (s *server) artifactMerge(r *http.Request, row domain.SessionMerge) *artifactMerge {
+	merge := &artifactMerge{
+		ID:        row.ID,
+		SessionID: row.SessionID,
+		Status:    row.Status,
+		JobID:     row.JobID,
+		SizeBytes: row.SizeBytes,
+		Attempts:  row.Attempts,
+		LastError: row.LastError,
+		CreatedAt: row.CreatedAt,
+		UpdatedAt: row.UpdatedAt,
+	}
+	if row.Status != domain.MergeSucceeded || row.DestBucket == nil || row.DestKey == nil ||
+		*row.DestBucket == "" || *row.DestKey == "" || s.deps.Files == nil {
+		return merge
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), s.filehouseTimeout())
+	defer cancel()
+	presigned, err := s.deps.Files.Mint(ctx, filehouse.MintRequest{
+		Bucket: *row.DestBucket,
+		Key:    *row.DestKey,
+		Method: http.MethodGet,
+	})
+	if err != nil {
+		s.log.Warn("merge download url failed",
+			"session_id", row.SessionID, "bucket", *row.DestBucket, "key", *row.DestKey, "error", err)
+		return merge
+	}
+	merge.DownloadURL = presigned.URL
+	return merge
 }
 
 // webcamClient returns the webcam-server client or answers 503.

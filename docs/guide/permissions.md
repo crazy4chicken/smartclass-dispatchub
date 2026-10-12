@@ -162,6 +162,38 @@ practical requirement is:
 Without them webcam-server answers `403` and the affected sessions fail with
 `upstream_unavailable`/`permission denied` details.
 
+The same credential drives smartclass-merge, so it needs the two `merge:*` keys as well:
+
+- `merge:write:any` - create the merge job for a completed recording (`POST /api/v1/merges`).
+  Creation has no `own` rung (a job that does not exist yet has no owner to compare against), and
+  the `team` rung only applies to a token carrying a team claim, so a service credential takes the
+  `any` scope.
+- `merge:read:any` - poll the job (`GET /api/v1/merges/{id}`) while it is `queued` or `running`.
+
+Both are needed because dispatchub both creates and follows the job, and merge resolves a
+single-job route against the job's scope before checking the caller's grants. Without them merge
+answers `403 insufficient_permissions`; dispatchub then retries submission until the poll TTL
+expires and marks the merge `failed` - the recording and its segments are unaffected, but no
+merged video appears. When `DISPATCH_MERGE_URL` is empty these keys are unused: dispatchub creates
+no merge job at all.
+
+The same credential also mints the merged video's presigned `download_url`, so it needs two
+**filehouse** keys on the destination bucket (`recordings`), where the merged objects live:
+
+- `filehouse:share:any` - authorizes minting a presigned URL at all
+  (`POST /api/v1/presign`).
+- `filehouse:read:any` - authorizes the read the minted URL exercises when it is redeemed
+  (filehouse re-checks permissions on redemption and the URL is not single-use).
+
+Both are required because filehouse evaluates the two grants separately against the **bucket
+resource**: `share` gates the mint itself, the exercised grant (`read` for a GET URL) gates the
+redemption. A credential holding only one of them gets `403` from the presign call, dispatchub logs
+the failure at Warn and omits `download_url` from the artifacts response - the merge object and
+every other field are still returned, so the caller sees a `succeeded` merge with no URL rather
+than an error. Scope the grants to the bucket where filehouse's policy allows it - dispatchub needs
+them only on the merge destination, not fleet-wide. When `DISPATCH_FILEHOUSE_URL` is empty the
+client is never built and these keys are unused.
+
 ## Teacher identity
 
 `teacher_username` is stored verbatim from the CSV. Where a token `sub` is needed - `own` scope,

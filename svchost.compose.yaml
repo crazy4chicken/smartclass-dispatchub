@@ -97,6 +97,8 @@ services:
       DISPATCH_TEAMUSERS_CLIENT_ID: dispatchub-svc
       DISPATCH_TEAMUSERS_CLIENT_SECRET: "${HOST:DISPATCH_TEAMUSERS_CLIENT_SECRET}"
       DISPATCH_WEBCAM_URL: "http://${HOST@webcam-server}:${PORT@webcam-server}" # same-namespace service reference
+      DISPATCH_MERGE_URL: "http://${HOST@merge}:${PORT@merge}" # same-namespace service reference; empty disables merging
+      DISPATCH_FILEHOUSE_URL: "http://${HOST@filewarehouse}:${PORT@filewarehouse}" # same-namespace service reference; internal address, no route prefix; mints the merged video's presigned download_url
       DISPATCH_PRESTART: 2m
       DISPATCH_POSTSTOP_GRACE: 15s
       DISPATCH_LOG_LEVEL: info
@@ -109,3 +111,34 @@ services:
     route:
       prefix: /dispatch
       strip: true # /dispatch/api/v1/... reaches the child process as /api/v1/...
+
+  merge:
+    source:
+      release: "github:crazy4chicken/smartclass-merge@v0.1.0"
+      # Before the first release exists, bootstrap from a local binary instead:
+      # path: /opt/merge/merge
+    args: ["run"]
+    env:
+      MERGE_LISTEN_ADDR: "${HOST}:${PORT}"
+      MERGE_DSN: "${HOST:MERGE_DSN}"
+      MERGE_TEAMUSERS_URL: "http://${HOST@teamusers}:${PORT@teamusers}"
+      MERGE_TEAMUSERS_ISSUER: teamusers
+      MERGE_TEAMUSERS_AUD: nekostick # MUST equal TEAMUSERS_TOKEN_AUDIENCE
+      MERGE_TEAMUSERS_CLIENT_ID: merge-svc
+      MERGE_TEAMUSERS_CLIENT_SECRET: "${HOST:MERGE_TEAMUSERS_CLIENT_SECRET}"
+      MERGE_FILEHOUSE_URL: "http://${HOST@filewarehouse}:${PORT@filewarehouse}" # internal address, no route prefix
+      MERGE_SOURCE_BUCKET: webcam-segments
+      MERGE_DEST_BUCKET: recordings # must exist in filewarehouse; the merged video is written here
+      MERGE_WORK_DIR: /var/lib/merge/work # persistent and writable; holds each job's temp video, size it for one recording per concurrent job
+      MERGE_MAX_CONCURRENT_JOBS: "1" # one merge at a time; raise it only with CPU and disk headroom
+      MERGE_LOG_LEVEL: info
+      # MERGE_FFMPEG_PATH: /usr/bin/ffmpeg # uncomment to use a host ffmpeg instead of the embedded build
+    start: eager # the queue should drain as soon as a recording stops producing segments
+    restart: on-failure # fatal errors exit non-zero; use `always` if a clean exit should also be restarted
+    health:
+      type: http
+      path: /readyz # covers Postgres, the work dir and the ffmpeg extraction; the first probe extracts the payload
+      timeout: 15s
+    route:
+      prefix: /merge
+      strip: true # /merge/api/v1/... reaches the child process as /api/v1/...

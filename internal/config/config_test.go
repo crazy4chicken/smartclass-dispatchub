@@ -14,6 +14,8 @@ var allEnvKeys = []string{
 	EnvTeamusersURL, EnvTeamusersIssuer, EnvTeamusersAud,
 	EnvTeamusersClientID, EnvTeamusersClientSecret, EnvTeamusersTimeout,
 	EnvWebcamURL, EnvWebcamTimeout, EnvSchedTick, EnvPrestart,
+	EnvMergeURL, EnvMergeTimeout, EnvMergePollInterval, EnvMergePollTTL,
+	EnvFilehouseURL, EnvFilehouseTimeout,
 	EnvPoststopGrace, EnvStartRetryMax, EnvMissGrace,
 	EnvPhotoPollInterval, EnvPhotoPollTTL, EnvMaxConcurrentCommands,
 	EnvMaxImportRows, EnvDev, EnvLogLevel, EnvFile,
@@ -70,6 +72,10 @@ func TestFromEnvDefaults(t *testing.T) {
 	durations := map[string]struct{ got, want time.Duration }{
 		"TeamusersTimeout":  {cfg.TeamusersTimeout, 5 * time.Second},
 		"WebcamTimeout":     {cfg.WebcamTimeout, 10 * time.Second},
+		"MergeTimeout":      {cfg.MergeTimeout, 10 * time.Second},
+		"MergePollInterval": {cfg.MergePollInterval, 5 * time.Second},
+		"MergePollTTL":      {cfg.MergePollTTL, 2 * time.Hour},
+		"FilehouseTimeout":  {cfg.FilehouseTimeout, 10 * time.Second},
 		"SchedTick":         {cfg.SchedTick, 30 * time.Second},
 		"Prestart":          {cfg.Prestart, 2 * time.Minute},
 		"PoststopGrace":     {cfg.PoststopGrace, 0},
@@ -81,6 +87,12 @@ func TestFromEnvDefaults(t *testing.T) {
 		if pair.got != pair.want {
 			t.Fatalf("%s = %s, want %s", name, pair.got, pair.want)
 		}
+	}
+	if cfg.MergeURL != "" {
+		t.Fatalf("MergeURL = %q, want empty (merging off by default)", cfg.MergeURL)
+	}
+	if cfg.FilehouseURL != "" {
+		t.Fatalf("FilehouseURL = %q, want empty (no download_url minted by default)", cfg.FilehouseURL)
 	}
 	if cfg.StartRetryMax != 3 || cfg.MaxConcurrentCommands != 8 || cfg.MaxImportRows != 5000 {
 		t.Fatalf("counts = %d/%d/%d, want 3/8/5000",
@@ -193,6 +205,12 @@ func TestFromEnvCustomValues(t *testing.T) {
 		EnvTeamusersTimeout:      "3s",
 		EnvWebcamURL:             "http://webcam:8080",
 		EnvWebcamTimeout:         "7s",
+		EnvMergeURL:              "http://merge:8080",
+		EnvMergeTimeout:          "6s",
+		EnvMergePollInterval:     "2s",
+		EnvMergePollTTL:          "3h",
+		EnvFilehouseURL:          "http://filehouse:8080",
+		EnvFilehouseTimeout:      "4s",
 		EnvSchedTick:             "45s",
 		EnvPrestart:              "90s",
 		EnvPoststopGrace:         "15s",
@@ -218,13 +236,16 @@ func TestFromEnvCustomValues(t *testing.T) {
 	}
 	if cfg.TeamusersURL != "http://iam:8080" || cfg.TeamusersIssuer != "issuer" ||
 		cfg.TeamusersAudience != "nekostick" || cfg.TeamusersClientID != "dispatchub-svc" ||
-		cfg.TeamusersClientSecret != "client-secret" || cfg.WebcamURL != "http://webcam:8080" {
+		cfg.TeamusersClientSecret != "client-secret" || cfg.WebcamURL != "http://webcam:8080" ||
+		cfg.MergeURL != "http://merge:8080" || cfg.FilehouseURL != "http://filehouse:8080" {
 		t.Fatalf("endpoint fields = %+v", cfg)
 	}
 	if cfg.TeamusersTimeout != 3*time.Second || cfg.WebcamTimeout != 7*time.Second ||
 		cfg.SchedTick != 45*time.Second || cfg.Prestart != 90*time.Second ||
 		cfg.PoststopGrace != 15*time.Second || cfg.MissGrace != time.Minute ||
-		cfg.PhotoPollInterval != 500*time.Millisecond || cfg.PhotoPollTTL != 20*time.Minute {
+		cfg.PhotoPollInterval != 500*time.Millisecond || cfg.PhotoPollTTL != 20*time.Minute ||
+		cfg.MergeTimeout != 6*time.Second || cfg.MergePollInterval != 2*time.Second ||
+		cfg.MergePollTTL != 3*time.Hour || cfg.FilehouseTimeout != 4*time.Second {
 		t.Fatalf("duration fields = %+v", cfg)
 	}
 	if cfg.StartRetryMax != 5 || cfg.MaxConcurrentCommands != 4 || cfg.MaxImportRows != 100 {
@@ -244,6 +265,13 @@ func TestFromEnvRejectsInvalidValues(t *testing.T) {
 		value string
 	}{
 		{EnvWebcamTimeout, "abc"},
+		{EnvMergeTimeout, "soon"},
+		{EnvMergePollInterval, "0s"},
+		{EnvMergePollTTL, "-1s"},
+		{EnvMergeTimeout, "0s"},
+		{EnvFilehouseTimeout, "0s"},
+		{EnvFilehouseTimeout, "-1s"},
+		{EnvFilehouseTimeout, "later"},
 		{EnvTeamusersTimeout, "5 seconds"},
 		{EnvStartRetryMax, "many"},
 		{EnvDev, "maybe"},
@@ -292,6 +320,12 @@ func TestRedactedMasksSecrets(t *testing.T) {
 		TeamusersTimeout:      5 * time.Second,
 		WebcamURL:             "http://webcam:8080",
 		WebcamTimeout:         10 * time.Second,
+		MergeURL:              "http://merge:8080",
+		MergeTimeout:          10 * time.Second,
+		MergePollInterval:     5 * time.Second,
+		MergePollTTL:          2 * time.Hour,
+		FilehouseURL:          "http://filehouse:8080",
+		FilehouseTimeout:      10 * time.Second,
 		SchedTick:             30 * time.Second,
 		Prestart:              2 * time.Minute,
 		StartRetryMax:         3,

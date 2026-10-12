@@ -1,19 +1,23 @@
 // Package scheduler drives the recording schedule. It owns advisory-lock
 // leader election, the claim/start/stop tick, upstream reconciliation via the
 // watchdog, missed-session housekeeping, the bounded outbound command
-// concurrency and the asynchronous photo-id resolver.
+// concurrency, the asynchronous photo-id resolver and the merge dispatch that
+// turns a completed recording into one video.
 package scheduler
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/config"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/domain"
+	"github.com/crazy4chicken/smartclass-dispatchub/internal/merge"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/store"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/webcam"
 )
@@ -23,6 +27,7 @@ import (
 type Deps struct {
 	Store  *store.Store
 	Webcam *webcam.Client
+	Merge  *merge.Client // nil = merging disabled
 	Config config.Config
 	Logger *slog.Logger
 	Clock  func() time.Time // nil = time.Now
@@ -33,6 +38,7 @@ type Deps struct {
 type Scheduler struct {
 	store    *store.Store
 	webcam   *webcam.Client
+	merge    *merge.Client
 	cfg      config.Config
 	logger   *slog.Logger
 	clock    func() time.Time
@@ -44,12 +50,16 @@ type Scheduler struct {
 const (
 	watchBatch             = 64            // sessions reconciled per tick
 	photoClaimBatch        = 64            // pending photos claimed per resolver pass
+	mergeDispatchBatch     = 64            // merge rows worked per tick
 	photoLookupBase        = 20            // upstream photo list size floor
 	photoLookupMax         = 200           // upstream photo list size ceiling
 	manualSessionTTL       = 4 * time.Hour // ad-hoc sessions have no scheduled end
 	startBackoffShift      = 4             // start retry backoff caps at 16 ticks
 	photoBackoffShift      = 6             // photo poll backoff caps at 64 intervals
 	adoptStreamLookupLimit = 50            // device streams scanned when adopting
+	// mergeMaxSubmitAttempts bounds pending→submitted retries: after this many
+	// deferred submissions the row is failed instead of retrying forever.
+	mergeMaxSubmitAttempts = 5
 )
 
 // New builds a Scheduler. It never reaches the network.
@@ -77,12 +87,27 @@ func New(deps Deps) *Scheduler {
 	if cfg.WebcamTimeout <= 0 {
 		cfg.WebcamTimeout = 10 * time.Second
 	}
+	if cfg.MergeTimeout <= 0 {
+		cfg.MergeTimeout = 10 * time.Second
+	}
+	if cfg.MergePollInterval <= 0 {
+		cfg.MergePollInterval = 5 * time.Second
+	}
+	if cfg.MergePollTTL <= 0 {
+		cfg.MergePollTTL = 2 * time.Hour
+	}
 	if cfg.MaxConcurrentCommands < 1 {
 		cfg.MaxConcurrentCommands = 1
+	}
+	// An unset Location would panic the destination-key formatter; the server
+	// validates DISPATCH_TIMEZONE, so only tests reach this.
+	if cfg.Location == nil {
+		cfg.Location = time.UTC
 	}
 	return &Scheduler{
 		store:    deps.Store,
 		webcam:   deps.Webcam,
+		merge:    deps.Merge,
 		cfg:      cfg,
 		logger:   logger,
 		clock:    clock,
@@ -214,6 +239,8 @@ func (s *Scheduler) tick(ctx context.Context) {
 	} else if missed > 0 {
 		s.logger.Warn("scheduler: planned sessions missed", "count", missed, "grace", s.cfg.MissGrace.String())
 	}
+
+	s.runMergeDispatch(ctx)
 }
 
 // startJob starts or retries one session.
@@ -397,6 +424,7 @@ func (s *Scheduler) completeSession(ctx context.Context, sess domain.Session, en
 		"room_code", sess.RoomCode,
 		"reason", reason,
 	)
+	s.enqueueMerge(ctx, sess)
 }
 
 // runStop stops one recording.
@@ -475,9 +503,15 @@ func (s *Scheduler) stopUpstream(ctx context.Context, sess domain.Session) (int,
 		}
 		return status, nil
 	}
-	if markErr := s.store.Sessions.MarkCompleted(ctx, sess.ID, endedAt); markErr != nil && !errors.Is(markErr, store.ErrConflict) {
-		return status, markErr
+	if markErr := s.store.Sessions.MarkCompleted(ctx, sess.ID, endedAt); markErr != nil {
+		if !errors.Is(markErr, store.ErrConflict) {
+			return status, markErr
+		}
+		// A conflict means the row left the completable states before the stop
+		// was recorded; there is nothing to merge.
+		return status, nil
 	}
+	s.enqueueMerge(ctx, sess)
 	return status, nil
 }
 
@@ -696,6 +730,324 @@ func (s *Scheduler) deferPhoto(ctx context.Context, photo domain.Photo, now time
 	if err := s.store.Photos.Defer(ctx, photo.ID, next, photo.Attempts+1); err != nil {
 		s.logger.Error("scheduler: defer photo", "photo_id", photo.ID, "error", err)
 	}
+}
+
+// enqueueMerge creates the pending merge job of a completed recording. It is
+// best effort: merging disabled, a session without a stream and a row that is
+// already enqueued are all no-ops, and every other failure is logged without
+// ever changing the session outcome.
+func (s *Scheduler) enqueueMerge(ctx context.Context, sess domain.Session) {
+	if s.merge == nil || sess.StreamID == nil || *sess.StreamID == "" {
+		return
+	}
+	if _, err := s.store.Merges.Enqueue(ctx, sess.ID); err != nil && !errors.Is(err, store.ErrConflict) {
+		s.logger.Warn("scheduler: enqueue merge",
+			"session_id", sess.ID,
+			"room_code", sess.RoomCode,
+			"error", err,
+		)
+	}
+}
+
+// runMergeDispatch works one bounded batch of due merge rows: it submits the
+// job of a pending row or polls a submitted one towards a terminal state. It
+// is a no-op without a merge client, and one failing row never aborts the
+// phase.
+func (s *Scheduler) runMergeDispatch(ctx context.Context) {
+	if s.merge == nil {
+		return
+	}
+	now := s.now()
+	rows, err := s.store.Merges.ClaimDue(ctx, now, mergeDispatchBatch)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.logger.Error("scheduler: claim due merges", "error", err)
+		}
+		return
+	}
+	for _, row := range rows {
+		if ctx.Err() != nil {
+			return
+		}
+		s.dispatchMerge(ctx, row, now)
+	}
+}
+
+// dispatchMerge advances one claimed merge row by one step. Both states share
+// the poll TTL: a job that never reaches a terminal state inside the budget is
+// failed so it leaves a visible row instead of polling forever.
+func (s *Scheduler) dispatchMerge(ctx context.Context, row domain.SessionMerge, now time.Time) {
+	if now.Sub(row.CreatedAt) > s.cfg.MergePollTTL {
+		s.failMerge(ctx, row, "merge did not finish within "+s.cfg.MergePollTTL.String())
+		return
+	}
+	next := now.Add(s.cfg.MergePollInterval)
+	switch row.Status {
+	case domain.MergePending:
+		s.submitMerge(ctx, row, next)
+	case domain.MergeSubmitted:
+		s.pollMerge(ctx, row, next)
+	}
+}
+
+// submitMerge submits a pending row's recording to smartclass-merge. The stream
+// metadata is read best effort: when it is unavailable the request carries no
+// fps and no codec, leaving both to merge's own defaults.
+func (s *Scheduler) submitMerge(ctx context.Context, row domain.SessionMerge, next time.Time) {
+	sess, err := s.store.Sessions.Get(ctx, row.SessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// The session vanished (its row is the merge row's parent), so no
+			// retry can ever find it.
+			s.failMerge(ctx, row, "session not found: "+row.SessionID)
+			return
+		}
+		s.deferMerge(ctx, row, next, mergeDetail(err))
+		return
+	}
+	if sess.StreamID == nil || *sess.StreamID == "" {
+		s.failMerge(ctx, row, "session has no stream to merge")
+		return
+	}
+	meta := s.mergeStreamMetadata(ctx, *sess.StreamID)
+	if codec, rejected := rejectedMergeCodec(meta); rejected {
+		s.failMerge(ctx, row, "codec "+codec+" cannot be merged")
+		return
+	}
+
+	req := merge.CreateRequest{
+		DeviceID:       sess.DeviceID,
+		StreamID:       *sess.StreamID,
+		FPS:            meta.FPS,
+		Codec:          meta.Codec,
+		DestKey:        mergeDestKey(s.cfg.Location, sess.RoomCode, sess.ID, sess.StartsAt),
+		IdempotencyKey: sess.ID,
+	}
+	callCtx, cancel := context.WithTimeout(ctx, s.cfg.MergeTimeout)
+	defer cancel()
+	var job merge.Job
+	callErr := s.withSlot(callCtx, func(ctx context.Context) error {
+		created, err := s.merge.Create(ctx, req)
+		if err != nil {
+			return err
+		}
+		job = created
+		return nil
+	})
+	if callErr != nil {
+		if permanentMergeSubmit(callErr) {
+			s.failMerge(ctx, row, mergeDetail(callErr))
+			return
+		}
+		s.deferMerge(ctx, row, next, mergeDetail(callErr))
+		return
+	}
+	if err := s.store.Merges.MarkSubmitted(ctx, row.ID, job.ID, next); err != nil {
+		s.logMergeStoreError("mark merge submitted", row, err)
+		return
+	}
+	s.logger.Info("scheduler: merge submitted",
+		"merge_id", row.ID,
+		"session_id", row.SessionID,
+		"job_id", job.ID,
+		"fps", req.FPS,
+		"codec", req.Codec,
+		"dest_key", req.DestKey,
+	)
+}
+
+// pollMerge reads one submitted job from smartclass-merge and mirrors its
+// terminal state onto the row.
+func (s *Scheduler) pollMerge(ctx context.Context, row domain.SessionMerge, next time.Time) {
+	if row.JobID == nil || *row.JobID == "" {
+		s.failMerge(ctx, row, "submitted merge has no job id")
+		return
+	}
+	callCtx, cancel := context.WithTimeout(ctx, s.cfg.MergeTimeout)
+	defer cancel()
+	var job merge.Job
+	callErr := s.withSlot(callCtx, func(ctx context.Context) error {
+		polled, err := s.merge.Get(ctx, *row.JobID)
+		if err != nil {
+			return err
+		}
+		job = polled
+		return nil
+	})
+	if callErr != nil {
+		if mergeJobMissing(callErr) {
+			s.failMerge(ctx, row, "merge job not found: "+*row.JobID)
+			return
+		}
+		s.deferMerge(ctx, row, next, mergeDetail(callErr))
+		return
+	}
+
+	switch job.Status {
+	case merge.JobSucceeded:
+		if err := s.store.Merges.MarkSucceeded(ctx, row.ID, job.Dest.Bucket, job.Dest.Key, job.Dest.SizeBytes, job.Dest.SHA256); err != nil {
+			s.logMergeStoreError("mark merge succeeded", row, err)
+			return
+		}
+		s.logger.Info("scheduler: merge succeeded",
+			"merge_id", row.ID,
+			"session_id", row.SessionID,
+			"job_id", job.ID,
+			"dest_bucket", job.Dest.Bucket,
+			"dest_key", job.Dest.Key,
+			"size_bytes", job.Dest.SizeBytes,
+		)
+	case merge.JobFailed, merge.JobCanceled:
+		s.failMerge(ctx, row, job.Error)
+	default:
+		// queued or running: merge is still working, poll again next interval.
+		s.deferMerge(ctx, row, next, job.Error)
+	}
+}
+
+// deferMerge reschedules the row for the next interval. A pending submission
+// that used its last allowed attempt is failed instead: the same body would be
+// sent once more for the same answer.
+func (s *Scheduler) deferMerge(ctx context.Context, row domain.SessionMerge, next time.Time, detail string) {
+	if row.Status == domain.MergePending && row.Attempts+1 >= mergeMaxSubmitAttempts {
+		s.failMerge(ctx, row, detail)
+		return
+	}
+	if err := s.store.Merges.Defer(ctx, row.ID, detail, next); err != nil {
+		s.logMergeStoreError("defer merge", row, err)
+		return
+	}
+	s.logger.Warn("scheduler: merge deferred",
+		"merge_id", row.ID,
+		"session_id", row.SessionID,
+		"status", row.Status,
+		"attempts", row.Attempts+1,
+		"upstream_detail", detail,
+		"next_poll_at", next.String(),
+	)
+}
+
+// failMerge terminates one merge row and logs why. It never touches the
+// session: a recording that completed stays completed even when its merge
+// could not be dispatched.
+func (s *Scheduler) failMerge(ctx context.Context, row domain.SessionMerge, detail string) {
+	if err := s.store.Merges.MarkFailed(ctx, row.ID, detail); err != nil {
+		s.logMergeStoreError("mark merge failed", row, err)
+		return
+	}
+	s.logger.Warn("scheduler: merge failed",
+		"merge_id", row.ID,
+		"session_id", row.SessionID,
+		"upstream_detail", detail,
+	)
+}
+
+// logMergeStoreError records a merge-row store failure; it is never fatal.
+func (s *Scheduler) logMergeStoreError(action string, row domain.SessionMerge, err error) {
+	s.logger.Error("scheduler: "+action,
+		"merge_id", row.ID,
+		"session_id", row.SessionID,
+		"error", err,
+	)
+}
+
+// mergeStreamMetadata reads the encoder state smartclass-merge sizes its job
+// with. It is best effort: on any error the caller submits without fps and
+// codec and lets merge sniff both.
+func (s *Scheduler) mergeStreamMetadata(ctx context.Context, streamID string) webcam.StreamMetadata {
+	callCtx, cancel := context.WithTimeout(ctx, s.cfg.WebcamTimeout)
+	defer cancel()
+	var meta webcam.StreamMetadata
+	err := s.withSlot(callCtx, func(ctx context.Context) error {
+		detail, err := s.webcam.StreamDetail(ctx, streamID)
+		if err != nil {
+			return err
+		}
+		meta = detail.Metadata
+		return nil
+	})
+	if err != nil {
+		s.logger.Debug("scheduler: merge stream metadata unavailable", "stream_id", streamID, "error", err)
+		return webcam.StreamMetadata{}
+	}
+	return meta
+}
+
+// mergeDestKey renders the destination object of one merged recording as
+// merged/<room_code>/<starts_at in loc as YYYY-MM-DD>/<session_id>.mp4. The
+// date comes from the configured time zone, so a recording that starts late in
+// the evening lands under its local calendar day.
+func mergeDestKey(loc *time.Location, roomCode, sessionID string, startsAt time.Time) string {
+	if loc == nil {
+		loc = time.UTC
+	}
+	return fmt.Sprintf("merged/%s/%s/%s.mp4", roomCode, startsAt.In(loc).Format("2006-01-02"), sessionID)
+}
+
+// rejectedMergeCodec reports the codec that makes a stream unmergeable before
+// the submission is sent. The settled codec decides when webcam-server reported
+// one; otherwise every advertised codec must be rejected, because a stream that
+// also offers a muxable codec can still be merged.
+func rejectedMergeCodec(meta webcam.StreamMetadata) (string, bool) {
+	if codec := normalizeCodec(meta.Codec); codec != "" {
+		if unmuxableCodec(codec) {
+			return codec, true
+		}
+		return "", false
+	}
+	if len(meta.Codecs) == 0 {
+		return "", false
+	}
+	first := ""
+	for _, advertised := range meta.Codecs {
+		codec := normalizeCodec(advertised)
+		if codec == "" {
+			// An unreported codec decides nothing on its own.
+			continue
+		}
+		if !unmuxableCodec(codec) {
+			return "", false
+		}
+		if first == "" {
+			first = codec
+		}
+	}
+	return first, first != ""
+}
+
+// unmuxableCodec reports the codecs smartclass-merge rejects: they have no raw
+// bitstream demuxer, so the job would only fail after submission.
+func unmuxableCodec(codec string) bool {
+	return codec == "vp8" || codec == "vp9"
+}
+
+// normalizeCodec lower-cases and trims a codec name for comparison.
+func normalizeCodec(codec string) string {
+	return strings.ToLower(strings.TrimSpace(codec))
+}
+
+// permanentMergeSubmit reports the submission failures that would repeat with
+// the same request body: a request merge rejected (400) or a credential that
+// lacks merge:write:any (403).
+func permanentMergeSubmit(err error) bool {
+	return merge.IsStatus(err, http.StatusBadRequest) || merge.IsStatus(err, http.StatusForbidden)
+}
+
+// mergeJobMissing reports the 404 merge answers for an unknown job id.
+func mergeJobMissing(err error) bool {
+	return merge.IsStatus(err, http.StatusNotFound)
+}
+
+// mergeDetail renders the operator-facing reason of a merge failure: the RFC
+// 9457 detail when the failure carries one, the error text otherwise.
+func mergeDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	if detail := merge.DetailOf(err); detail != "" {
+		return detail
+	}
+	return err.Error()
 }
 
 // commandPool bounds the number of concurrent outbound webcam commands to

@@ -25,11 +25,17 @@ Status: design proposal. No code exists yet in this directory.
 7. **Documentation site** — VitePress site under `docs/` with an OpenAPI document generated from the
    live router, built by pnpm and published to GitHub Pages by CI (§12). Required deliverable, same
    toolchain as `smartclass-webcam-server` and `nsc-msghub`.
+8. **Merge tracking** — after a recording completes, schedule one **smartclass-merge** job
+   (`internal/merge`) that remuxes the segments into a single playable video in filehouse, track it
+   in `session_merges`, and expose the resulting object through the artifacts endpoint (§8.6).
 
 ### Out of scope
 
-- Media storage / transcoding / remuxing — webcam-server writes segments to nsc-filehouse or S3;
-  dispatchub stores only ids and asks webcam-server for short-lived download URLs on demand.
+- Media storage itself — webcam-server writes segments to nsc-filehouse or S3 and dispatchub never
+  holds bytes; it stores only ids and asks webcam-server for short-lived download URLs on demand.
+  Remuxing is delegated to **smartclass-merge**: dispatchub schedules one merge job per completed
+  recording and tracks it (§8.6), but the transcoding work and the merged object belong to that
+  service and filehouse.
 - Device provisioning in webcam-server (`POST /api/devices`, token rotation) — stays with the
   existing admin flow. dispatchub only reads devices.
 - Live video preview — webcam-server exposes **no** MJPEG/HLS/RTSP endpoint (see §11, risk R3).
@@ -109,16 +115,19 @@ smartclass-dispatchub/
   cmd/dispatchub/main.go          # subcommands: run | status | doctor | register-permissions | migrate
   cmd/genspec/main.go             # walks the chi router -> docs/public/openapi.yaml (predocs:* hook)
   migrations/0001_init.sql        # goose Up/Down
+  migrations/0002_session_merges.sql  # merge ledger (Up/Down)
   migrations/embed.go             # //go:embed *.sql
   internal/config/config.go       # DISPATCH_* env, Validate(), Redacted()
   internal/httpx/                 # WriteJSON / DecodeJSON / WriteProblem (RFC 9457)
   internal/httpapi/               # router.go, routes.go, handlers, doc.go (DocOperations table)
   internal/iamauth/               # teamusers SDK wiring + scope ladder + register.go
   internal/store/                 # pool.go, migrate.go, errors.go, terms.go, rooms.go,
-                                  # imports.go, sessions.go, photos.go, commands.go
+                                  # imports.go, sessions.go, photos.go, commands.go, merges.go
   internal/timetable/             # csv.go (parse+validate), weeks.go (week expansion), materialize.go
   internal/webcam/                # client.go, tokencache.go, types.go  (typed webcam-server client)
-  internal/scheduler/             # scheduler.go (claim/stop/watchdog), leader.go
+  internal/merge/                 # client.go, types.go  (typed smartclass-merge client)
+  internal/filehouse/             # client.go, types.go  (typed nsc-filehouse presign client)
+  internal/scheduler/             # scheduler.go (claim/stop/watchdog/merge), leader.go
   internal/domain/                # domain structs with JSON tags
   internal/id/                    # ULID helper (crypto/rand, no external dep) — filehouse precedent
   docs/
@@ -165,6 +174,12 @@ and a `pnpm-workspace.yaml` carrying `allowBuilds: {esbuild: true}` plus the plu
 | `DISPATCH_TEAMUSERS_TIMEOUT` | `5s` | IAM HTTP timeout. |
 | `DISPATCH_WEBCAM_URL` | — (required) | webcam-server base URL, e.g. `http://webcam:8080`. |
 | `DISPATCH_WEBCAM_TIMEOUT` | `10s` | Outbound HTTP timeout. |
+| `DISPATCH_MERGE_URL` | — (empty ⇒ merging disabled) | smartclass-merge base URL, e.g. `http://merge:8083`. Empty disables merging: nothing is enqueued or polled, and no presence requirement is enforced by `Validate()`. |
+| `DISPATCH_MERGE_TIMEOUT` | `10s` | Outbound HTTP timeout for merge calls (must be positive). |
+| `DISPATCH_MERGE_POLL_INTERVAL` | `5s` | Cadence of merge submit retries and job polls (must be positive). |
+| `DISPATCH_MERGE_POLL_TTL` | `2h` | Wall-clock budget of one merge before the row is marked `failed` (must be positive). |
+| `DISPATCH_FILEHOUSE_URL` | — (empty ⇒ no `download_url`) | nsc-filehouse base URL, e.g. `http://filewarehouse:8080`. It mints the merged video's presigned `download_url` for the artifacts response; empty means no URL is minted and the field is omitted — never a presence requirement. |
+| `DISPATCH_FILEHOUSE_TIMEOUT` | `10s` | Outbound HTTP timeout for filehouse presign calls (must be positive). |
 | `DISPATCH_SCHED_TICK` | `30s` | Scheduler scan interval. |
 | `DISPATCH_PRESTART` | `2m` | How early a session's recording starts. |
 | `DISPATCH_POSTSTOP_GRACE` | `0s` | Delay before stopping at `ends_at`. |
@@ -358,6 +373,39 @@ CREATE UNIQUE INDEX idx_camera_commands_idem ON camera_commands(idempotency_key)
   WHERE idempotency_key IS NOT NULL;
 ```
 
+`migrations/0002_session_merges.sql` adds the merge ledger (same unqualified DDL style as `0001`):
+
+```sql
+-- +goose Up
+CREATE TABLE session_merges (                   -- one merge job per completed recording
+  id           TEXT PRIMARY KEY,
+  session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  status       TEXT NOT NULL CHECK (status IN ('pending','submitted','succeeded','failed')),
+  job_id       TEXT,                            -- smartclass-merge job id once submitted
+  dest_bucket  TEXT,                            -- storage coordinates: kept for download_url minting, never exposed by the API
+  dest_key     TEXT,
+  size_bytes   BIGINT,
+  sha256       TEXT,                            -- stored digest; the API never returns it
+  attempts     INTEGER NOT NULL DEFAULT 0,      -- submission attempts
+  last_error   TEXT,
+  next_poll_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  claimed_at   TIMESTAMPTZ,                     -- claim lease, like session_photos
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX idx_session_merges_session ON session_merges(session_id);
+CREATE INDEX idx_session_merges_due ON session_merges(next_poll_at)
+  WHERE status IN ('pending','submitted');
+
+-- +goose Down
+DROP TABLE IF EXISTS session_merges;
+```
+
+The ledger column vocabulary (`pending`/`submitted`/`succeeded`/`failed`) lives in
+`internal/domain` alongside the session and photo vocabularies, one row per session (the unique
+index makes a duplicate enqueue a no-op), so a merge is addressable per recording without a second
+join table.
+
 Segment rows are deliberately **not** mirrored: given `sessions.stream_id`, segments (ids, sizes,
 durations, order) are re-derived from `GET /api/streams/{stream_id}/`, and `download_url`s are minted
 on demand. That is the whole point of persisting the stream id.
@@ -390,7 +438,7 @@ router, so the spec can be regenerated in CI with no infrastructure running.
 | GET | `/api/v1/timetable/imports/{id}` | `dispatch:read:` | Batch detail incl. per-row errors. |
 | GET | `/api/v1/sessions` | `dispatch:read:` | Filters `?term_code=&room_code=&date=&status=&course_code=`. |
 | GET | `/api/v1/sessions/{id}` | `dispatch:read:` | Session detail + photo ledger + live upstream status. |
-| GET | `/api/v1/sessions/{id}/artifacts` | `dispatch:read:` | `{stream_id, status, segments:[{segment_seq,size_bytes,duration_ms,download_url}], photos:[{photo_id,taken_at,download_url}]}` — URLs fetched live from webcam-server (15-min TTL), never cached. |
+| GET | `/api/v1/sessions/{id}/artifacts` | `dispatch:read:` | `{stream_id, status, segments:[{segment_seq,size_bytes,duration_ms,download_url}], photos:[{photo_id,taken_at,download_url}], merge?}` — segment/photo URLs fetched live from webcam-server (15-min TTL), never cached; `merge` is the public `session_merges` projection (`{id, session_id, status, job_id?, download_url?, size_bytes?, attempts, last_error?, created_at, updated_at}`, statuses `pending`/`submitted`/`succeeded`/`failed`), omitted when absent or on a store error. `download_url` is minted per response by filehouse (`POST /api/v1/presign`, ~15-min TTL, never cached) only when `status == "succeeded"` and both destination coordinates are set — best effort, so any mint failure logs Warn (`merge download url failed`) and omits the field without failing the response. The bucket/key/sha256 stay in `session_merges` and never reach a caller. |
 | POST | `/api/v1/sessions/{id}/recording/start` | `dispatch:control:` | Manual start for a planned session (early start / re-start after `failed`). |
 | POST | `/api/v1/sessions/{id}/recording/stop` | `dispatch:control:` | Manual stop. |
 | POST | `/api/v1/rooms/{room_code}/recording/start` | `dispatch:control:` | Ad-hoc start (creates a `manual` session). |
@@ -488,6 +536,8 @@ stateDiagram-v2
    retrying. This is the only defence against the fact that webcam-server sends no events.
 5. **Housekeeping**: `planned` sessions past `starts_at + MISS_GRACE` → `missed` with a WARN log
    (metric-ready counter), so operators see unattended scheduling gaps.
+6. **Merge**: enqueue and advance the `session_merges` ledger (§8.6), skipped entirely when
+   `DISPATCH_MERGE_URL` is empty.
 
 Concurrency is capped by `DISPATCH_MAX_CONCURRENT_COMMANDS`; the scheduler uses a bounded worker pool,
 not one goroutine per session.
@@ -525,6 +575,64 @@ dispatchub). The poller is a single goroutine with a bounded batch
 (`SELECT … WHERE status='pending' AND next_poll_at <= now() FOR UPDATE SKIP LOCKED`), so a webcam-server
 outage degrades into growing `next_poll_at` delays instead of a hot loop.
 
+### 8.6 Merge pipeline (smartclass-merge)
+
+A completed recording's segments are raw length-prefixed `.bin` chunks with no container, so they do
+not play. **smartclass-merge** turns them into one container (`mp4`/`mov` per codec) and stores it in
+filehouse; dispatchub owns the scheduling of that job and its ledger, never the bytes.
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant D as dispatchub store
+    participant M as smartclass-merge
+    participant F as nsc-filehouse
+    S->>D: MarkCompleted (stop path / watchdog)
+    S->>D: Merges.Enqueue(session_id) → status='pending'
+    Note over S: DISPATCH_MERGE_URL empty ⇒ no row, phase skipped
+    loop every MERGE_POLL_INTERVAL, until terminal or MERGE_POLL_TTL
+        S->>D: Merges.ClaimDue(now)  (pending/submitted, lease)
+        S->>M: POST /api/v1/merges {device_id,stream_id,fps,codec?,dest.key}
+        M-->>S: 201 {id,status:"queued"} → status='submitted'
+        S->>M: GET /api/v1/merges/{id}
+        M-->>S: running / succeeded{dest{...}} / failed
+    end
+    M->>F: PUT dest.bucket/dest.key (merged video)
+    Note over D: succeeded → dest_bucket/dest_key/size_bytes/sha256 persisted
+```
+
+- **Enqueue.** Right after every successful `MarkCompleted` — the stop path and the watchdog path —
+  `store.Merges.Enqueue` inserts one row per session (unique index; a duplicate enqueue is a no-op).
+  Failed sessions are never merged, a session without a `stream_id` is skipped, and an enqueue error
+  is logged but never fatal to the session.
+- **Submit (`pending`).** Load the session, read `webcam.StreamDetail(stream_id)` for the codec/fps as
+  a best effort (metadata failure keeps `fps = 0` / empty codec and lets merge sniff), and build
+  `dest.key = merged/<room_code>/<starts_at in DISPATCH_TIMEZONE as YYYY-MM-DD>/<session_id>.mp4`.
+  `POST /api/v1/merges` carries `device_id` + `stream_id` and `dest.key` only — never `segments`
+  (merge lists `{device_id}/streams/{stream_id}/` itself) and never `dest.bucket` (merge's
+  `MERGE_DEST_BUCKET` default is the single source of truth). `X-Idempotency-Key = session_id` makes
+  an unknown-outcome retry replay merge's original job instead of creating a second one.
+  `400 invalid_request` / `403 insufficient_permissions` are permanent → `failed`; a `vp8`/`vp9`
+  codec from the metadata is `failed` without a call (merge has no raw-bitstream demuxer for them);
+  anything else → `Defer` to the next poll, and `failed` once `attempts >= mergeMaxSubmitAttempts`
+  (5).
+- **Poll (`submitted`).** `GET /api/v1/merges/{job_id}`: `succeeded` → `MarkSucceeded` with merge's
+  `dest` (`bucket`, `key`, `size_bytes`, `sha256`); `failed`/`canceled` → `MarkFailed(job.Error)`;
+  `queued`/`running` → `Defer`. `404 job_not_found` is terminal; a transport error or `5xx` defers.
+- **TTL guard.** Both states: `now - created_at > DISPATCH_MERGE_POLL_TTL` → `MarkFailed("merge did
+  not finish within <ttl>")`, so a job with no terminal state leaves an inspectable row.
+- **Client + probes.** `internal/merge` mirrors `internal/webcam` (typed `Create`/`Get`/`Ready`,
+  client-credentials token with one forced refresh on 401, RFC 9457 `UpstreamError`, the same retry
+  and body-cap conventions). `cmd/dispatchub` builds it next to `webcam.New` only when
+  `cfg.MergeURL != ""`, passes it into `scheduler.Deps`, and adds the `checker.merge` probe
+  (`Ready`) to `status`/`doctor`. `internal/filehouse` follows the same shape (`Mint` = `POST
+  /api/v1/presign` with retry policy attempts 2 on transport/`5xx` only; `Ready` = public `GET
+  /readyz` with no token and no retry), is built only when `cfg.FilehouseURL != ""`, reaches
+  `httpapi.Deps.Files`, and adds the `checker.filehouse` probe.
+- **Failure isolation.** A merge failure never changes the session's own status: the recording is
+  still `completed`, and the outcome lives on the `session_merges` row exposed at
+  `GET /api/v1/sessions/{id}/artifacts` (§7).
+
 ---
 
 ## 9. HTTP client to webcam-server (`internal/webcam`)
@@ -546,12 +654,15 @@ outage degrades into growing `next_poll_at` delays instead of a hot loop.
 - `log/slog` JSON to stdout; every outbound call logs `{room_code, session_id, action, http_status,
   duration_ms, upstream_detail}`. No tokens, no `download_url`s in logs.
 - `/healthz` always 200 while the process lives; `/readyz` checks Postgres ping and
-  `GET {DISPATCH_WEBCAM_URL}/readyz`.
-- `dispatchub status` prints redacted config + DB version + webcam reachability;
+  `GET {DISPATCH_WEBCAM_URL}/readyz`, plus merge's `GET {DISPATCH_MERGE_URL}/readyz` when
+  `DISPATCH_MERGE_URL` is set.
+- `dispatchub status` prints redacted config + DB version + webcam, merge and filehouse reachability
+  (`checker.filehouse` is skipped when `DISPATCH_FILEHOUSE_URL` is empty);
   `dispatchub doctor` runs the same checks with a 30 s timeout and exits non-zero on failure.
 - Counters are log-derived (org has no metrics stack today); if one is added later, the scheduler
   emits `sessions_started_total`, `sessions_failed_total`, `sessions_missed_total`,
-  `photo_resolution_seconds`.
+  `photo_resolution_seconds`, `merges_enqueued_total`, `merges_succeeded_total`,
+  `merges_failed_total` and `merge_resolution_seconds`.
 
 ---
 
@@ -562,7 +673,7 @@ outage degrades into growing `next_poll_at` delays instead of a hot loop.
 | R1 | webcam-server never reconciles `active` streams after a crash — the next start returns 409 forever for that (device, camera). | §8.3 adopt-on-409 removes the blocking; a duplicate-looking active stream is adopted, and the watchdog finalizes it. Operators may still need a manual stop for orphaned streams. |
 | R2 | No webhook/event feed upstream. | Polling everywhere (photo resolution, watchdog). Accepted cost. |
 | R3 | No live-preview endpoint exists in webcam-server (no MJPEG/HLS/RTSP); frames only flow device→accumulator→object storage. | Out of scope here. If the product needs live view, that is a webcam-server feature request (WS passthrough or MJPEG), tracked separately. |
-| R4 | Recorded segments are raw length-prefixed `.bin` chunks with no container and no recorded codec (`StreamMetadata.codec` is never set upstream); playback needs a decoder/remux step that does not exist yet. | dispatchub persists only ids; playback is a known gap to raise with the webcam-server owner before promising end-user 回放. |
+| R4 | Recorded segments are raw length-prefixed `.bin` chunks with no container and no recorded codec (`StreamMetadata.codec` is never set upstream); playback needs a decoder/remux step. | **Addressed by smartclass-merge.** dispatchub enqueues a merge on every completed recording and tracks it in `session_merges` (§8.6), sending `fps`/`codec` from the stream metadata and letting merge sniff when the metadata is silent; merge remuxes the raw bitstreams into `mp4`/`mov` with `-c:v copy` (libx264 fallback) and uploads the video to filehouse. dispatchub persists only the ids plus the job ledger, so it still stores no video and serves no byte stream — playback goes through the filehouse-minted `download_url` on the artifacts response. `vp8`/`vp9` recordings remain unmuxable and fail the merge job rather than blocking the session. |
 | R5 | teamusers has no confirmed `username → sub` lookup endpoint, and carries no teacher/class model. | `teacher_user_id` is nullable and resolved lazily; `own`-scoped access falls back to `team`/`any`. Confirm the endpoint in phase 0. |
 | R6 | Time correctness: period times are wall-clock local; a mis-set `week1_monday` silently schedules a whole term wrongly. | `dry_run` import returns the expanded first/last occurrence per row; `timezone` is explicit config; import is idempotent so a corrected re-import replaces cleanly. |
 | R7 | Room/permission drift: `rooms.team_id/owner_id` snapshots go stale if the device is re-owned in webcam-server. | Re-bind refreshes the snapshot; document that binding is the source of truth for scope resolution. |
@@ -614,8 +725,8 @@ is published twice: downloadable as `/openapi.yaml`, and rendered per tag into
 | `guide/getting-started.md` | Local run: Postgres, migrations, `DISPATCH_*` env, first term + 节次 table + room binding + CSV import, first manual recording. |
 | `guide/deploy.md` | Fleet deployment: the complete `svchost.compose.yaml` below, walkthrough of the `${HOST:...}` / `${HOST@svc}` templates, a note per field, the full configuration reference (one row per env var in §4), health probes, `status` / `doctor`. |
 | `guide/permissions.md` | The teamusers model, the nine `dispatch:*` keys, the `any > team > own` ladder, registering permissions, minting the client credential. |
-| `guide/api-usage.md` | End-to-end walkthrough: import CSV → sessions materialize → scheduled recording → artifacts, plus every mid-session control call. |
-| `guide/operations.md` | Scheduler semantics (prestart, stop grace, retries, adopt-on-409), `missed`/`failed` triage, photo-resolution lag, upstream outage behaviour. |
+| `guide/api-usage.md` | End-to-end walkthrough: import CSV → sessions materialize → scheduled recording → artifacts (incl. the `merge` object and how to fetch the merged video), plus every mid-session control call. |
+| `guide/operations.md` | Scheduler semantics (prestart, stop grace, retries, adopt-on-409), the merge tick phase and its state machine, `missed`/`failed`/merge triage, photo-resolution lag, upstream outage behaviour, the log-derived counters. |
 | `api/overview.md` | Base URL, auth, error model (problem+json and the stable `detail` codes), the `{"items":[…]}` envelope, `limit` rules, OpenAPI download link. |
 
 **The compose example that must ship.** `guide/deploy.md` embeds the complete `svchost.compose.yaml`
@@ -723,6 +834,8 @@ services:
       DISPATCH_TEAMUSERS_CLIENT_ID: dispatchub-svc
       DISPATCH_TEAMUSERS_CLIENT_SECRET: "${HOST:DISPATCH_TEAMUSERS_CLIENT_SECRET}"
       DISPATCH_WEBCAM_URL: "http://${HOST@webcam-server}:${PORT@webcam-server}" # same-namespace service reference
+      DISPATCH_MERGE_URL: "http://${HOST@merge}:${PORT@merge}" # same-namespace service reference; empty disables merging
+      DISPATCH_FILEHOUSE_URL: "http://${HOST@filewarehouse}:${PORT@filewarehouse}" # same-namespace service reference; internal address, no route prefix; mints the merged video's presigned download_url
       DISPATCH_PRESTART: 2m
       DISPATCH_POSTSTOP_GRACE: 15s
       DISPATCH_LOG_LEVEL: info
@@ -735,6 +848,37 @@ services:
     route:
       prefix: /dispatch
       strip: true # /dispatch/api/v1/... reaches the child process as /api/v1/...
+
+  merge:
+    source:
+      release: "github:crazy4chicken/smartclass-merge@v0.1.0"
+      # Before the first release exists, bootstrap from a local binary instead:
+      # path: /opt/merge/merge
+    args: ["run"]
+    env:
+      MERGE_LISTEN_ADDR: "${HOST}:${PORT}"
+      MERGE_DSN: "${HOST:MERGE_DSN}"
+      MERGE_TEAMUSERS_URL: "http://${HOST@teamusers}:${PORT@teamusers}"
+      MERGE_TEAMUSERS_ISSUER: teamusers
+      MERGE_TEAMUSERS_AUD: nekostick # MUST equal TEAMUSERS_TOKEN_AUDIENCE
+      MERGE_TEAMUSERS_CLIENT_ID: merge-svc
+      MERGE_TEAMUSERS_CLIENT_SECRET: "${HOST:MERGE_TEAMUSERS_CLIENT_SECRET}"
+      MERGE_FILEHOUSE_URL: "http://${HOST@filewarehouse}:${PORT@filewarehouse}" # internal address, no route prefix
+      MERGE_SOURCE_BUCKET: webcam-segments
+      MERGE_DEST_BUCKET: recordings # must exist in filewarehouse; the merged video is written here
+      MERGE_WORK_DIR: /var/lib/merge/work # persistent and writable; holds each job's temp video, size it for one recording per concurrent job
+      MERGE_MAX_CONCURRENT_JOBS: "1" # one merge at a time; raise it only with CPU and disk headroom
+      MERGE_LOG_LEVEL: info
+      # MERGE_FFMPEG_PATH: /usr/bin/ffmpeg # uncomment to use a host ffmpeg instead of the embedded build
+    start: eager # the queue should drain as soon as a recording stops producing segments
+    restart: on-failure # fatal errors exit non-zero; use `always` if a clean exit should also be restarted
+    health:
+      type: http
+      path: /readyz # covers Postgres, the work dir and the ffmpeg extraction; the first probe extracts the payload
+      timeout: 15s
+    route:
+      prefix: /merge
+      strip: true # /merge/api/v1/... reaches the child process as /api/v1/...
 ```
 
 Notes the deploy guide must state next to that example:
@@ -749,8 +893,9 @@ Notes the deploy guide must state next to that example:
   `macos` with the entry binary named exactly `dispatchub` - `dispatchub.exe` on Windows - at the
   ZIP root, and the process CWD will be the service root rather than that extraction directory.
 - **A dangling `${...@svc}` reference fails that service's sync.** Dropping the `filewarehouse` block
-  means also dropping `WEBCAM_FILEHOUSE_URL`; an unresolvable service-name target is a sync failure,
-  not a silent empty string. (The `nsc-filewarehouse` compose circulating in the fleet sets
+  means also dropping `WEBCAM_FILEHOUSE_URL`, `MERGE_FILEHOUSE_URL` and `DISPATCH_FILEHOUSE_URL`; an
+  unresolvable service-name target is a sync failure, not a silent empty string. (The
+  `nsc-filewarehouse` compose circulating in the fleet sets
   `FILEWAREHOUSE_*` names that do not match the binary's `FILEHOUSE_*` config constants — use the names
   above.)
 - **Health paths differ in meaning.** `/healthz` is the liveness check the supervisor should use;
@@ -760,6 +905,13 @@ Notes the deploy guide must state next to that example:
   `/ws/device/{ticket}`). If devices must not be reachable through the host router, give
   webcam-server its own Host/compose without a `route` block and keep only dispatchub behind the
   gateway — dispatchub reaches it over the internal `${HOST@webcam-server}` address either way.
+- **The merge block is optional but self-contained.** Dropping `merge` means also dropping
+  `DISPATCH_MERGE_URL` (the reference would fail the sync); with the variable cleared, dispatchub
+  completes recordings exactly as before and simply never schedules a merge, so the artifacts
+  response carries no `merge` object. The `merge` service brings its own `MERGE_DSN`, work
+  directory, source/destination buckets and ffmpeg payload — none of which dispatchub touches; the
+  only coupling is dispatchub's `merge:write:any` + `merge:read:any` grants for create/poll (see
+  `guide/permissions.md`).
 - **One digest, one architecture.** `source.sha256` holds a single value, so it cannot match both the
   x64 and arm64 ZIPs; pin it for single-architecture deployments, or set `strictSources: true`
   together with the matching digest.
@@ -836,6 +988,19 @@ webcam-server.
 *Acceptance:* tag push produces a release asset; `go test ./...` passes with the integration suite
 skipped by default and green when `DISPATCH_TEST_PG` is set.
 
+**M6 — Merge integration.** `internal/merge` typed client, `session_merges` ledger
+(`0002_session_merges.sql`), enqueue on every successful completion, tick phase 6 (submit with
+`X-Idempotency-Key = session_id`, poll to terminal, TTL guard, retry/permanent classification), the
+`merge` object on the artifacts response, and the `checker.merge` probe; `DISPATCH_MERGE_*` config
+plus the fleet compose block. Increment 2 adds `internal/filehouse` (`Mint`/`Ready`), the `checker.filehouse`
+probe, the per-response `download_url` on the `merge` object, and the `DISPATCH_FILEHOUSE_*` config
+(empty URL ⇒ no URL minted).
+*Acceptance:* a completed recording gains a `session_merges` row that reaches `succeeded`, and
+`GET /api/v1/sessions/{id}/artifacts` hands out a filehouse-minted `download_url` for an object that
+filehouse holds without ever exposing its storage coordinates; a merge failure leaves the session
+`completed`; with `DISPATCH_MERGE_URL` empty no row is created and the artifacts response omits
+`merge`; with `DISPATCH_FILEHOUSE_URL` empty the response carries no `download_url`.
+
 ---
 
 ## 14. Open questions for the owner
@@ -847,4 +1012,6 @@ skipped by default and green when `DISPATCH_TEST_PG` is set.
    capture requirement expected later? Periodic capture would be implemented in dispatchub as a
    per-session ticker, but it changes the photo volume and storage cost materially.
 4. Playback requirement (R4): does the product need watchable video, or are segments + photos enough
-   for this phase?
+   for this phase? — **Resolved:** watchable video is in scope via smartclass-merge (§8.6); dispatchub
+   triggers the merge on every completed recording and hands out a filehouse-minted, short-lived
+   `download_url` for the merged object at `GET /api/v1/sessions/{id}/artifacts`.

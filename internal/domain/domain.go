@@ -43,6 +43,14 @@ const (
 	PhotoSourceManual    = "manual"
 )
 
+// Merge job states (session_merges.status).
+const (
+	MergePending   = "pending"   // row created, job not submitted yet
+	MergeSubmitted = "submitted" // job id stored, polling
+	MergeSucceeded = "succeeded"
+	MergeFailed    = "failed"
+)
+
 // Command outcomes (camera_commands.outcome).
 const (
 	OutcomeAccepted = "accepted"
@@ -166,6 +174,25 @@ type Photo struct {
 	TakenAt    time.Time  `json:"taken_at"`
 	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
+}
+
+// SessionMerge tracks one recording's merge job in smartclass-merge. It is a
+// storage-only type and is never serialized directly: the artifacts endpoint
+// maps it to a public shape that omits the object-storage coordinates.
+type SessionMerge struct {
+	ID         string
+	SessionID  string
+	Status     string
+	JobID      *string
+	DestBucket *string
+	DestKey    *string
+	SizeBytes  *int64
+	SHA256     *string
+	Attempts   int
+	LastError  *string
+	NextPollAt *time.Time
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // Command is the audit and idempotency record of one control command sent to

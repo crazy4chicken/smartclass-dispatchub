@@ -25,8 +25,10 @@ import (
 	_ "time/tzdata"
 
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/config"
+	"github.com/crazy4chicken/smartclass-dispatchub/internal/filehouse"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/httpapi"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/iamauth"
+	"github.com/crazy4chicken/smartclass-dispatchub/internal/merge"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/scheduler"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/store"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/webcam"
@@ -188,7 +190,18 @@ func runServer(cfg config.Config, log *slog.Logger) int {
 	defer auth.Close()
 
 	cameras := webcam.New(cfg.WebcamURL, auth, cfg.WebcamTimeout, log)
-	tasks := scheduler.New(scheduler.Deps{Store: db, Webcam: cameras, Config: cfg, Logger: log})
+	deps := scheduler.Deps{Store: db, Webcam: cameras, Config: cfg, Logger: log}
+	if cfg.MergeURL != "" {
+		deps.Merge = merge.New(cfg.MergeURL, auth, cfg.MergeTimeout, log)
+	}
+	// The filehouse client mints presigned download URLs for merged videos.
+	// An empty URL disables minting, so the artifacts endpoint omits
+	// download_url instead of failing.
+	var files *filehouse.Client
+	if cfg.FilehouseURL != "" {
+		files = filehouse.New(cfg.FilehouseURL, auth, cfg.FilehouseTimeout, log)
+	}
+	tasks := scheduler.New(deps)
 
 	schedulerErr := make(chan error, 1)
 	go func() {
@@ -199,6 +212,7 @@ func runServer(cfg config.Config, log *slog.Logger) int {
 		Store:    db,
 		Commands: tasks,
 		Webcam:   cameras,
+		Files:    files,
 		Auth:     auth,
 		Config:   cfg,
 		Logger:   log,
@@ -297,6 +311,8 @@ func runStatus(cfg config.Config, log *slog.Logger) int {
 	c := &checker{ctx: ctx}
 	c.postgres(cfg)
 	c.webcam(cfg, log)
+	c.merge(cfg, log)
+	c.filehouse(cfg, log)
 	return 0
 }
 
@@ -308,6 +324,8 @@ func runDoctor(cfg config.Config, log *slog.Logger) int {
 	c := &checker{ctx: ctx}
 	c.postgres(cfg)
 	c.webcam(cfg, log)
+	c.merge(cfg, log)
+	c.filehouse(cfg, log)
 	if c.failed {
 		return 1
 	}
@@ -350,6 +368,42 @@ func (c *checker) webcam(cfg config.Config, log *slog.Logger) {
 		return
 	}
 	c.pass("webcam", "reachable: "+cfg.WebcamURL)
+}
+
+// merge probes smartclass-merge's /readyz without a service token; the probe is
+// public. It is skipped when merging is disabled, which is a configuration
+// choice rather than a failure.
+func (c *checker) merge(cfg config.Config, log *slog.Logger) {
+	if strings.TrimSpace(cfg.MergeURL) == "" {
+		c.skip("merge", config.EnvMergeURL+" is not configured (merging disabled)")
+		return
+	}
+	client := merge.New(cfg.MergeURL, merge.TokenSourceFunc(func(context.Context) (string, error) {
+		return "", errors.New("readiness probe requires no service token")
+	}), cfg.MergeTimeout, log)
+	if err := client.Ready(c.ctx); err != nil {
+		c.fail("merge", err)
+		return
+	}
+	c.pass("merge", "reachable: "+cfg.MergeURL)
+}
+
+// filehouse probes nsc-filehouse's /readyz without a service token; the probe
+// is public. It is skipped when no filehouse URL is configured, which only
+// disables download_url minting rather than failing anything.
+func (c *checker) filehouse(cfg config.Config, log *slog.Logger) {
+	if strings.TrimSpace(cfg.FilehouseURL) == "" {
+		c.skip("filehouse", config.EnvFilehouseURL+" is not configured (download_url minting disabled)")
+		return
+	}
+	client := filehouse.New(cfg.FilehouseURL, filehouse.TokenSourceFunc(func(context.Context) (string, error) {
+		return "", errors.New("readiness probe requires no service token")
+	}), cfg.FilehouseTimeout, log)
+	if err := client.Ready(c.ctx); err != nil {
+		c.fail("filehouse", err)
+		return
+	}
+	c.pass("filehouse", "reachable: "+cfg.FilehouseURL)
 }
 
 // runRegisterPermissions upserts the dispatch:* catalog in teamusers. The

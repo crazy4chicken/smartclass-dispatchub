@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/config"
+	"github.com/crazy4chicken/smartclass-dispatchub/internal/filehouse"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/httpx"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/iamauth"
 	"github.com/crazy4chicken/smartclass-dispatchub/internal/scheduler"
@@ -43,6 +44,10 @@ type Deps struct {
 	// Webcam is the typed webcam-server client used for device validation,
 	// live state, control commands and artifact URLs.
 	Webcam *webcam.Client
+	// Files is the typed nsc-filehouse client that mints the merged video's
+	// presigned download URL. It may be nil, in which case the artifacts
+	// endpoint reports no download_url.
+	Files *filehouse.Client
 	// Auth verifies bearer tokens and enforces the dispatch:* permissions.
 	Auth *iamauth.Authorizer
 	// Config is the effective service configuration.

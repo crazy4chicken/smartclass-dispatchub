@@ -142,7 +142,18 @@ GET /api/v1/sessions/{id}/artifacts
       "taken_at": "2026-09-07T00:05:12Z",
       "download_url": "https://files.example.com/files/...?expires=..."
     }
-  ]
+  ],
+  "merge": {
+    "id": "01J8Z6MERGE000000000000000",
+    "session_id": "01J8Z4SESS0000000000000000",
+    "status": "succeeded",
+    "job_id": "01J8Z0Q7RD3F9K1V0P4S8M2W6X",
+    "download_url": "https://files.example.com/files/...?expires=...",
+    "size_bytes": 110075904,
+    "attempts": 1,
+    "created_at": "2026-09-07T00:45:03Z",
+    "updated_at": "2026-09-07T00:47:11Z"
+  }
 }
 ```
 
@@ -150,6 +161,41 @@ dispatchub does not mirror segment rows: they are re-derived from the recorded `
 download URLs are minted live by webcam-server with a **15-minute TTL** - never cache or persist
 them. A `stream_id` with no segments yet returns the session's current upstream status with an
 empty list.
+
+### The merged video
+
+The `merge` object is the tracking row for the single smartclass-merge job that turns the recording's
+segments into one playable video. It is created on every successful completion, so a session that is
+still recording (or that `failed`) has no `merge` member - the field is omitted, not empty - and a
+deployment with `DISPATCH_MERGE_URL` unset never creates one either.
+
+| Field | Meaning |
+| --- | --- |
+| `id` | dispatchub's own `session_merges` row id. |
+| `session_id` | The recording this merge belongs to. |
+| `status` | `pending` (created, not submitted), `submitted` (job id stored, polling), `succeeded`, `failed`. |
+| `job_id` | smartclass-merge's job id; set once `status` leaves `pending`. |
+| `download_url` | Presigned URL for the merged video, minted per response by nsc-filehouse; see the TTL note below. |
+| `size_bytes` | The stored size filehouse reported, on `succeeded`. |
+| `attempts` | Submission/poll attempts consumed. |
+| `last_error` | The upstream failure of the last attempt; present while retrying or after a failure. |
+| `created_at` / `updated_at` | Row timestamps. |
+
+Poll the artifacts endpoint until `status` is `succeeded`; only then is there a `download_url`.
+`failed` is terminal and carries the cause in `last_error`; `pending`/`submitted` are still in
+flight (see [Operations → Merge](/guide/operations#6-merge) for the retry rules).
+
+`download_url` is minted by **nsc-filehouse on every request** and never cached or persisted by
+dispatchub: it is valid for about **15 minutes** (filehouse's default TTL), so request the artifacts
+again when it expires instead of storing it. The field is absent from a response in three cases: the
+merge is not `succeeded` yet (there is nothing to download), the deployment sets no
+`DISPATCH_FILEHOUSE_URL` (no URL is minted at all), or filehouse is unreachable when the request is
+handled - minting is best effort, so the response still carries the merge object and answers `200`,
+just without a URL; retry the request.
+
+dispatchub never exposes the object's storage coordinates (`dest_bucket`/`dest_key` and the stored
+`sha256`) to a caller - they stay in its database, where `download_url` minting reads them. The
+merged video is served by nsc-filehouse, which owns the bucket; a client only ever needs the URL.
 
 ## Mid-session control
 

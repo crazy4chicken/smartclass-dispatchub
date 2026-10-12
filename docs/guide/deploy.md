@@ -6,8 +6,8 @@ outline: 2
 # Deployment
 
 This guide covers the Nekostick/svchost path used by the SmartClass fleet: one compose document
-declares the four services (teamusers, filewarehouse, webcam-server, dispatchub), the Host injects
-addresses, ports and secrets, and dispatchub is deployed as a singleton scheduler.
+declares the five services (teamusers, filewarehouse, webcam-server, dispatchub, merge), the Host
+injects addresses, ports and secrets, and dispatchub is deployed as a singleton scheduler.
 
 ## Prerequisites
 
@@ -21,6 +21,10 @@ addresses, ports and secrets, and dispatchub is deployed as a singleton schedule
   dispatchub. See [Permissions and access control](/guide/permissions).
 - **A smartclass-webcam-server instance** with its devices provisioned and an nsc-filehouse (or
   S3) media sink configured upstream. dispatchub stores only ids; it never touches the media.
+- **A smartclass-merge instance** with its own database, a writable work directory sized for the
+  recordings and the `recordings` destination bucket present in filehouse. Leave
+  `DISPATCH_MERGE_URL` empty to deploy dispatchub without it: completing a recording is then
+  recorded here and never merged.
 - **svchost** or any other supervisor that can run a Linux binary with environment variables.
 
 ## Release artifact
@@ -60,6 +64,12 @@ set, and real environment variables always win over it:
 | `DISPATCH_TEAMUSERS_TIMEOUT` | `5s` | No | IAM HTTP timeout. |
 | `DISPATCH_WEBCAM_URL` | - | `run` (unless `DISPATCH_DEV=true`) | smartclass-webcam-server base URL, e.g. `http://webcam:8080`. |
 | `DISPATCH_WEBCAM_TIMEOUT` | `10s` | No | Outbound HTTP timeout. |
+| `DISPATCH_MERGE_URL` | - | No | smartclass-merge base URL; empty disables merging: a completed recording is never submitted. |
+| `DISPATCH_MERGE_TIMEOUT` | `10s` | No | Outbound HTTP timeout. |
+| `DISPATCH_MERGE_POLL_INTERVAL` | `5s` | No | Cadence of merge-job submission retries and job polls. |
+| `DISPATCH_MERGE_POLL_TTL` | `2h` | No | Wall-clock budget of one merge before it is marked `failed`. |
+| `DISPATCH_FILEHOUSE_URL` | - | No | nsc-filehouse base URL, e.g. `http://filewarehouse:8080`; it mints the merged video's presigned `download_url` for the artifacts response. Empty (the default) means no download URL is minted - the artifacts response then omits `download_url` - and it is never a presence requirement. |
+| `DISPATCH_FILEHOUSE_TIMEOUT` | `10s` | No | Outbound HTTP timeout for the filehouse presign calls. |
 | `DISPATCH_SCHED_TICK` | `30s` | No | Scheduler scan interval. |
 | `DISPATCH_PRESTART` | `2m` | No | How early a session's recording starts. |
 | `DISPATCH_POSTSTOP_GRACE` | `0s` | No | Delay before stopping at `ends_at`. |
@@ -75,7 +85,8 @@ set, and real environment variables always win over it:
 | `DISPATCH_TEAMUSERS_ADMIN_TOKEN` | - | `register-permissions` | teamusers admin bearer token; the `-token` flag wins. A secret. |
 
 `DISPATCH_*_TIMEOUT`, `DISPATCH_SCHED_TICK`, `DISPATCH_PRESTART`, `DISPATCH_POSTSTOP_GRACE`,
-`DISPATCH_MISS_GRACE`, `DISPATCH_PHOTO_POLL_INTERVAL` and `DISPATCH_PHOTO_POLL_TTL` accept Go
+`DISPATCH_MISS_GRACE`, `DISPATCH_PHOTO_POLL_INTERVAL`, `DISPATCH_PHOTO_POLL_TTL`,
+`DISPATCH_MERGE_POLL_INTERVAL` and `DISPATCH_MERGE_POLL_TTL` accept Go
 duration syntax (`300ms`, `2m`, `1h`). Loading fails fast on an unparsable duration, an unknown
 timezone or an unknown log level, and each subcommand then enforces only the variables it uses -
 `run` every endpoint and credential above, `migrate` the DSN, `register-permissions` the teamusers
@@ -190,6 +201,8 @@ services:
       DISPATCH_TEAMUSERS_CLIENT_ID: dispatchub-svc
       DISPATCH_TEAMUSERS_CLIENT_SECRET: "${HOST:DISPATCH_TEAMUSERS_CLIENT_SECRET}"
       DISPATCH_WEBCAM_URL: "http://${HOST@webcam-server}:${PORT@webcam-server}" # same-namespace service reference
+      DISPATCH_MERGE_URL: "http://${HOST@merge}:${PORT@merge}" # same-namespace service reference; empty disables merging
+      DISPATCH_FILEHOUSE_URL: "http://${HOST@filewarehouse}:${PORT@filewarehouse}" # same-namespace service reference; internal address, no route prefix; mints the merged video's presigned download_url
       DISPATCH_PRESTART: 2m
       DISPATCH_POSTSTOP_GRACE: 15s
       DISPATCH_LOG_LEVEL: info
@@ -202,10 +215,42 @@ services:
     route:
       prefix: /dispatch
       strip: true # /dispatch/api/v1/... reaches the child process as /api/v1/...
+
+  merge:
+    source:
+      release: "github:crazy4chicken/smartclass-merge@v0.1.0"
+      # Before the first release exists, bootstrap from a local binary instead:
+      # path: /opt/merge/merge
+    args: ["run"]
+    env:
+      MERGE_LISTEN_ADDR: "${HOST}:${PORT}"
+      MERGE_DSN: "${HOST:MERGE_DSN}"
+      MERGE_TEAMUSERS_URL: "http://${HOST@teamusers}:${PORT@teamusers}"
+      MERGE_TEAMUSERS_ISSUER: teamusers
+      MERGE_TEAMUSERS_AUD: nekostick # MUST equal TEAMUSERS_TOKEN_AUDIENCE
+      MERGE_TEAMUSERS_CLIENT_ID: merge-svc
+      MERGE_TEAMUSERS_CLIENT_SECRET: "${HOST:MERGE_TEAMUSERS_CLIENT_SECRET}"
+      MERGE_FILEHOUSE_URL: "http://${HOST@filewarehouse}:${PORT@filewarehouse}" # internal address, no route prefix
+      MERGE_SOURCE_BUCKET: webcam-segments
+      MERGE_DEST_BUCKET: recordings # must exist in filewarehouse; the merged video is written here
+      MERGE_WORK_DIR: /var/lib/merge/work # persistent and writable; holds each job's temp video, size it for one recording per concurrent job
+      MERGE_MAX_CONCURRENT_JOBS: "1" # one merge at a time; raise it only with CPU and disk headroom
+      MERGE_LOG_LEVEL: info
+      # MERGE_FFMPEG_PATH: /usr/bin/ffmpeg # uncomment to use a host ffmpeg instead of the embedded build
+    start: eager # the queue should drain as soon as a recording stops producing segments
+    restart: on-failure # fatal errors exit non-zero; use `always` if a clean exit should also be restarted
+    health:
+      type: http
+      path: /readyz # covers Postgres, the work dir and the ffmpeg extraction; the first probe extracts the payload
+      timeout: 15s
+    route:
+      prefix: /merge
+      strip: true # /merge/api/v1/... reaches the child process as /api/v1/...
 ```
 
 Before applying it to a real host, replace the two example values: the filehouse public origin
-(`https://files.example.com/files`) and the release versions if you pin a different one.
+(`https://files.example.com/files`) and the release versions if you pin a different one - the merge
+release tag in particular, because it carries the ffmpeg payload for that platform.
 
 ### Template walkthrough
 
@@ -232,12 +277,14 @@ svchost resolves three template forms inside `env` values:
   on Windows - at the ZIP root, and the process CWD will be the service root rather than that
   extraction directory.
 - **A dangling `${...@svc}` reference fails that service's sync.** Dropping the `filewarehouse` block
-  means also dropping `WEBCAM_FILEHOUSE_URL`; an unresolvable service-name target is a sync failure,
-  not a silent empty string. (The `nsc-filewarehouse` compose circulating in the fleet sets
-  `FILEWAREHOUSE_*` names that do not match the binary's `FILEHOUSE_*` config constants - use the
-  names above.)
+  means also dropping `WEBCAM_FILEHOUSE_URL`, `MERGE_FILEHOUSE_URL` and `DISPATCH_FILEHOUSE_URL`;
+  dropping `merge` means also dropping `DISPATCH_MERGE_URL`. An unresolvable service-name target is a
+  sync failure, not a silent empty string. (The `nsc-filewarehouse` compose circulating in the fleet
+  sets `FILEWAREHOUSE_*` names that do not match the binary's `FILEHOUSE_*` config constants - use
+  the names above.)
 - **Health paths differ in meaning.** `/healthz` is the liveness check the supervisor should use;
-  `/readyz` additionally probes Postgres and webcam-server, so it belongs on the operator dashboard.
+  `/readyz` additionally probes Postgres and webcam-server here, and Postgres, the work dir and the
+  ffmpeg extraction in the `merge` launch, so it belongs on the operator dashboard.
 - **Device-plane exposure is an explicit decision.** `route.prefix: /webcam` publishes the entire
   webcam-server surface, including the `wdt_`-token device plane (`/ws/register`,
   `/ws/device/{ticket}`). If devices must not be reachable through the host router, give
@@ -245,7 +292,11 @@ svchost resolves three template forms inside `env` values:
   gateway - dispatchub reaches it over the internal `${HOST@webcam-server}` address either way.
 - **One digest, one architecture.** `source.sha256` holds a single value, so it cannot match both the
   x64 and arm64 ZIPs; pin it for single-architecture deployments, or set `strictSources: true`
-  together with the matching digest.
+  together with the matching digest. Each merge asset also embeds a different ffmpeg payload, so its
+  digest differs per architecture by construction.
+- **The merge queue is shared through PostgreSQL, not the network.** Every merge process watches the
+  same `merge_jobs` table and claims with `FOR UPDATE SKIP LOCKED`, so a second `merge` replica does
+  not double work - but it needs its own `MERGE_WORK_DIR`.
 - **Scope choice.** `serviceScope: global` (used above) shares one service root and one service-name
   namespace across configs - a duplicate service name makes the whole reconciliation round fail -
   while `serviceScope: document` isolates roots per config name. dispatchub must be declared exactly
@@ -311,30 +362,81 @@ svchost resolves three template forms inside `env` values:
 | `DISPATCH_TEAMUSERS_ISSUER` / `..._AUD` | `teamusers` / `nekostick`; the audience must match `TEAMUSERS_TOKEN_AUDIENCE`. |
 | `DISPATCH_TEAMUSERS_CLIENT_ID` / `..._SECRET` | dispatchub's service credential; the secret comes from the Host. |
 | `DISPATCH_WEBCAM_URL` | Same-namespace service reference to webcam-server. |
+| `DISPATCH_MERGE_URL` | Same-namespace service reference to the `merge` block below. Clear it and dispatchub stops creating merge jobs; a completed recording then keeps its segments only. |
+| `DISPATCH_FILEHOUSE_URL` | Same-namespace service reference to the `filewarehouse` block above, over the internal address with no route prefix. It is the only use dispatchub makes of filehouse: minting the merged video's presigned `download_url` per artifacts response. Clear it and the artifacts response omits `download_url` (the storage coordinates stay in dispatchub's database); the merge itself is unaffected. |
 | `DISPATCH_PRESTART` / `DISPATCH_POSTSTOP_GRACE` | Example overrides (`2m` / `15s`); both default differently, see the reference table. |
 | `DISPATCH_LOG_LEVEL` | `slog` JSON level. |
 | `start` / `restart` | `eager` (the scheduler must be up before the first lesson window) / `on-failure` (fatal errors exit non-zero; use `always` to also restart clean exits). |
 | `health` | `GET /healthz` for the supervisor. Use `/readyz` on the dashboard: it also probes Postgres and webcam-server. |
 | `route` | `prefix: /dispatch`, `strip: true`: `/dispatch/api/v1/...` reaches the child as `/api/v1/...`. |
 
+`merge`
+
+| Field | Note |
+| --- | --- |
+| `source.release` | `merge_<version>_<platform>_<arch>.zip`, binary `merge`; the commented `path:` is the bootstrap route before the first release exists. Each asset embeds the ffmpeg payload for its platform, so pin the tag that matches the host architecture. |
+| `MERGE_LISTEN_ADDR` | `${HOST}:${PORT}` - bind to the launch lease. |
+| `MERGE_DSN` | The merge database DSN; migrations are applied from the embedded FS at startup. |
+| `MERGE_TEAMUSERS_URL` | Internal teamusers address; JWKS is discovered under it. |
+| `MERGE_TEAMUSERS_ISSUER` / `..._AUD` | `teamusers` / `nekostick`; the audience must match `TEAMUSERS_TOKEN_AUDIENCE`. |
+| `MERGE_TEAMUSERS_CLIENT_ID` / `..._SECRET` | merge's service credential; the secret comes from the Host. It is also the token merge presents to filehouse, so filehouse must accept this teamusers issuer. |
+| `MERGE_FILEHOUSE_URL` | Same-namespace service reference to filewarehouse; both buckets must exist there. |
+| `MERGE_SOURCE_BUCKET` / `MERGE_DEST_BUCKET` | Read segments from the first (webcam-server's sink) and write merged videos to the second. dispatchub never sends a bucket: `MERGE_SOURCE_BUCKET` is the single source of truth and the destination defaults to `MERGE_DEST_BUCKET`. |
+| `MERGE_WORK_DIR` | Persistent and writable, sized for one recording per concurrent job. Never point it at `artifacts/` or `tmp/`. |
+| `MERGE_MAX_CONCURRENT_JOBS` | `1` unless the host has CPU and disk headroom. |
+| `MERGE_FFMPEG_PATH` | Commented out: the embedded build is the default. A host ffmpeg is the escape hatch when shipping a GPL binary is not acceptable. |
+| `start` / `restart` | `eager` (the queue should drain as soon as a recording stops producing segments) / `on-failure` (fatal errors exit non-zero; use `always` to also restart clean exits). |
+| `health` | `GET /readyz` with a 15 s timeout, because the first probe extracts the embedded ffmpeg payload into `MERGE_WORK_DIR`. |
+| `route` | `prefix: /merge`, `strip: true`: `/merge/api/v1/...` reaches the child as `/api/v1/...`. |
+
 ## First-time setup
 
 1. **Store the host values** referenced by the compose file:
-   `TEAMUSERS_CONNECTION_STRING`, `FILEHOUSE_DSN`, `WEBCAM_DB_URL`, `DISPATCH_DSN`,
-   `TEAMUSERS_CLIENT_SECRET` equivalents used above (`FILEHOUSE_TEAMUSERS_CLIENT_SECRET`,
-   `WEBCAM_TEAMUSERS_CLIENT_SECRET`, `DISPATCH_TEAMUSERS_CLIENT_SECRET`).
+   `TEAMUSERS_CONNECTION_STRING`, `FILEHOUSE_DSN`, `WEBCAM_DB_URL`, `DISPATCH_DSN`, `MERGE_DSN`,
+   and the service-client secrets used above (`FILEHOUSE_TEAMUSERS_CLIENT_SECRET`,
+   `WEBCAM_TEAMUSERS_CLIENT_SECRET`, `DISPATCH_TEAMUSERS_CLIENT_SECRET`,
+   `MERGE_TEAMUSERS_CLIENT_SECRET`).
 2. **Register the nine `dispatch:*` keys** in teamusers and bind them to roles. Either run
    `dispatchub register-permissions` against the instance or use the raw registration calls in the
    [permissions guide](/guide/permissions#catalog-registration).
-3. **Create the service credentials** (`filehouse-svc`, `webcam-server-svc`, `dispatchub-svc`) in
-   teamusers and place their secrets in the Host values.
-4. **Give the dispatchub credential the `cam:*` keys it needs** to call webcam-server: in practice
+3. **Register the six `merge:*` keys** in teamusers and bind them to roles:
+   `merge:read:any`, `merge:read:team`, `merge:read:own`, `merge:write:any`, `merge:write:team`
+   and `merge:write:own`. `merge register-permissions -token <teamusers admin token>` upserts them
+   idempotently against the instance, exactly as `dispatchub register-permissions` does for the
+   `dispatch:*` catalog.
+4. **Create the destination bucket** the merged videos land in: `recordings` in the filehouse
+   webcam-server already writes segments to. The source bucket (`webcam-segments`) must exist as
+   well - it is webcam-server's sink - and a missing destination bucket makes merge reject every
+   create with `400 invalid_request`. Create both through the filehouse API or its console before
+   the first job.
+5. **Create the service credentials** (`filehouse-svc`, `webcam-server-svc`, `dispatchub-svc`,
+   `merge-svc`) in teamusers and place their secrets in the Host values.
+6. **Give the dispatchub credential the `cam:*` keys it needs** to call webcam-server: in practice
    `cam:read:any` and `cam:control:any` cover the union of the scope ladders dispatchub uses.
-5. **Bind at least one room** (`PUT /api/v1/rooms/{room_code}`) before the first import, otherwise
-   every CSV row fails validation with `room_not_bound`.
-6. **Apply the compose document** and verify: `GET /dispatch/readyz` answers 200 through the host
-   route, and `dispatchub status` prints the redacted configuration with a reachable database and
-   webcam-server.
+7. **Give the dispatchub credential the two `merge:*` keys** it needs to drive the merge queue:
+   `merge:write:any` to create a job per completed recording and `merge:read:any` to poll it, in
+   addition to the `cam:*` keys. Without them merge answers `403 insufficient_permissions` and the
+   merge row stays on its submission attempts until the TTL marks it failed - the recording itself
+   is unaffected.
+8. **Give the dispatchub credential the two filehouse keys** it needs to mint the merged video's
+   download URL on the destination bucket (`recordings`): `filehouse:share:any` and
+   `filehouse:read:any`. Both are required, because minting a presigned GET evaluates two separate
+   grants against the bucket resource: `filehouse:share:any` authorizes *minting* the URL, and
+   `filehouse:read:any` authorizes the read the URL will exercise when it is redeemed. Missing
+   either one makes `POST /api/v1/presign` answer `403`; the artifacts response then omits
+   `download_url` and the caller cannot fetch the merged video. Scope the grants to the bucket if
+   the filehouse policy supports it - dispatchub needs them only on the merge destination.
+9. **Give the merge credential its filehouse access**: merge lists the source bucket and writes the
+   destination bucket with the `merge-svc` token, so filehouse's policy for that account must allow
+   reads on `webcam-segments` and writes on `recordings`. merge needs no `merge:*` key of its own -
+   those exist for its callers.
+10. **Bind at least one room** (`PUT /api/v1/rooms/{room_code}`) before the first import, otherwise
+    every CSV row fails validation with `room_not_bound`.
+11. **Apply the compose document** and verify: `GET /dispatch/readyz` answers 200 through the host
+    route, `dispatchub status` prints the redacted configuration with a reachable database,
+    webcam-server, merge and filehouse (the filehouse probe appears only when
+    `DISPATCH_FILEHOUSE_URL` is set), and `GET /merge/readyz` answers 200 for the merge launch
+    itself.
 
 ## Health and diagnostics
 
@@ -342,7 +444,7 @@ svchost resolves three template forms inside `env` values:
 | --- | --- |
 | `GET /healthz` | Liveness: 200 while the process lives. This is the supervisor's probe. |
 | `GET /readyz` | Readiness: Postgres ping plus `GET {DISPATCH_WEBCAM_URL}/readyz`. Use it on the operator dashboard. |
-| `dispatchub status` | Prints the redacted configuration, the database version and webcam-server reachability, then exits. |
+| `dispatchub status` | Prints the redacted configuration, the database version and webcam-server reachability, then exits. Also probes merge (`GET {DISPATCH_MERGE_URL}/readyz`) when `DISPATCH_MERGE_URL` is set, and filehouse (`GET {DISPATCH_FILEHOUSE_URL}/readyz`, a public route) when `DISPATCH_FILEHOUSE_URL` is set. |
 | `dispatchub doctor` | Runs the same checks with a 30 s timeout and exits non-zero on failure. Suitable for a cron or a deployment gate. |
 
 Security notes:

@@ -1,6 +1,6 @@
 // Package store owns every PostgreSQL interaction: connection pooling, goose
 // migrations and the SQL behind terms, rooms, imports, entries, sessions,
-// photos and camera commands.
+// photos, merge jobs and camera commands.
 package store
 
 import (
@@ -43,6 +43,7 @@ type Store struct {
 	Entries  *Entries
 	Sessions *Sessions
 	Photos   *Photos
+	Merges   *Merges
 	Commands *Commands
 
 	// ownsSchema is true when the DSN left search_path alone, so Schema is this
@@ -83,6 +84,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		Entries:    &Entries{db: pool},
 		Sessions:   &Sessions{db: pool},
 		Photos:     &Photos{db: pool},
+		Merges:     &Merges{db: pool},
 		Commands:   &Commands{db: pool},
 		ownsSchema: !pinnedSchema,
 	}, nil

@@ -25,6 +25,12 @@ const (
 	EnvTeamusersTimeout      = "DISPATCH_TEAMUSERS_TIMEOUT"
 	EnvWebcamURL             = "DISPATCH_WEBCAM_URL"
 	EnvWebcamTimeout         = "DISPATCH_WEBCAM_TIMEOUT"
+	EnvMergeURL              = "DISPATCH_MERGE_URL"
+	EnvMergeTimeout          = "DISPATCH_MERGE_TIMEOUT"
+	EnvMergePollInterval     = "DISPATCH_MERGE_POLL_INTERVAL"
+	EnvMergePollTTL          = "DISPATCH_MERGE_POLL_TTL"
+	EnvFilehouseURL          = "DISPATCH_FILEHOUSE_URL"
+	EnvFilehouseTimeout      = "DISPATCH_FILEHOUSE_TIMEOUT"
 	EnvSchedTick             = "DISPATCH_SCHED_TICK"
 	EnvPrestart              = "DISPATCH_PRESTART"
 	EnvPoststopGrace         = "DISPATCH_POSTSTOP_GRACE"
@@ -47,6 +53,10 @@ const (
 	defaultTeamusersAudience     = "teamusers"
 	defaultTeamusersTimeout      = 5 * time.Second
 	defaultWebcamTimeout         = 10 * time.Second
+	defaultMergeTimeout          = 10 * time.Second
+	defaultMergePollInterval     = 5 * time.Second
+	defaultMergePollTTL          = 2 * time.Hour
+	defaultFilehouseTimeout      = 10 * time.Second
 	defaultSchedTick             = 30 * time.Second
 	defaultPrestart              = 2 * time.Minute
 	defaultPoststopGrace         = time.Duration(0)
@@ -73,6 +83,12 @@ type Config struct {
 	TeamusersTimeout      time.Duration  // DISPATCH_TEAMUSERS_TIMEOUT, default 5s
 	WebcamURL             string         // DISPATCH_WEBCAM_URL (required unless Dev)
 	WebcamTimeout         time.Duration  // DISPATCH_WEBCAM_TIMEOUT, default 10s
+	MergeURL              string         // DISPATCH_MERGE_URL, empty disables merging
+	MergeTimeout          time.Duration  // DISPATCH_MERGE_TIMEOUT, default 10s
+	MergePollInterval     time.Duration  // DISPATCH_MERGE_POLL_INTERVAL, default 5s
+	MergePollTTL          time.Duration  // DISPATCH_MERGE_POLL_TTL, default 2h
+	FilehouseURL          string         // DISPATCH_FILEHOUSE_URL, empty disables download_url minting
+	FilehouseTimeout      time.Duration  // DISPATCH_FILEHOUSE_TIMEOUT, default 10s
 	SchedTick             time.Duration  // DISPATCH_SCHED_TICK, default 30s
 	Prestart              time.Duration  // DISPATCH_PRESTART, default 2m
 	PoststopGrace         time.Duration  // DISPATCH_POSTSTOP_GRACE, default 0s
@@ -108,6 +124,8 @@ func FromEnv() (Config, error) {
 		TeamusersClientID:     os.Getenv(EnvTeamusersClientID),
 		TeamusersClientSecret: os.Getenv(EnvTeamusersClientSecret),
 		WebcamURL:             envOr(EnvWebcamURL, ""),
+		MergeURL:              envOr(EnvMergeURL, ""),
+		FilehouseURL:          envOr(EnvFilehouseURL, ""),
 		LogLevel:              envOr(EnvLogLevel, defaultLogLevel),
 	}
 	var err error
@@ -115,6 +133,18 @@ func FromEnv() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.WebcamTimeout, err = envDuration(EnvWebcamTimeout, defaultWebcamTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.MergeTimeout, err = envDuration(EnvMergeTimeout, defaultMergeTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.MergePollInterval, err = envDuration(EnvMergePollInterval, defaultMergePollInterval); err != nil {
+		return Config{}, err
+	}
+	if cfg.MergePollTTL, err = envDuration(EnvMergePollTTL, defaultMergePollTTL); err != nil {
+		return Config{}, err
+	}
+	if cfg.FilehouseTimeout, err = envDuration(EnvFilehouseTimeout, defaultFilehouseTimeout); err != nil {
 		return Config{}, err
 	}
 	if cfg.SchedTick, err = envDuration(EnvSchedTick, defaultSchedTick); err != nil {
@@ -182,6 +212,18 @@ func (c Config) Validate() error {
 	}
 	if c.WebcamTimeout <= 0 {
 		errs = append(errs, fmt.Errorf("%s must be positive", EnvWebcamTimeout))
+	}
+	if c.MergeTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("%s must be positive", EnvMergeTimeout))
+	}
+	if c.MergePollInterval <= 0 {
+		errs = append(errs, fmt.Errorf("%s must be positive", EnvMergePollInterval))
+	}
+	if c.MergePollTTL <= 0 {
+		errs = append(errs, fmt.Errorf("%s must be positive", EnvMergePollTTL))
+	}
+	if c.FilehouseTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("%s must be positive", EnvFilehouseTimeout))
 	}
 	if c.SchedTick <= 0 {
 		errs = append(errs, fmt.Errorf("%s must be positive", EnvSchedTick))
@@ -280,6 +322,12 @@ func (c Config) Redacted() []string {
 		EnvTeamusersTimeout + "=" + c.TeamusersTimeout.String(),
 		EnvWebcamURL + "=" + c.WebcamURL,
 		EnvWebcamTimeout + "=" + c.WebcamTimeout.String(),
+		EnvMergeURL + "=" + c.MergeURL,
+		EnvMergeTimeout + "=" + c.MergeTimeout.String(),
+		EnvMergePollInterval + "=" + c.MergePollInterval.String(),
+		EnvMergePollTTL + "=" + c.MergePollTTL.String(),
+		EnvFilehouseURL + "=" + c.FilehouseURL,
+		EnvFilehouseTimeout + "=" + c.FilehouseTimeout.String(),
 		EnvSchedTick + "=" + c.SchedTick.String(),
 		EnvPrestart + "=" + c.Prestart.String(),
 		EnvPoststopGrace + "=" + c.PoststopGrace.String(),

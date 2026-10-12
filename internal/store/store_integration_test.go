@@ -1217,3 +1217,173 @@ func sessionIDsOfCommands(commands []domain.Command) []string {
 	}
 	return ids
 }
+
+func TestIntegrationSessionMerges(t *testing.T) {
+	s := testStore(t)
+	seedTermRoom(t, s)
+	ctx := t.Context()
+	now := time.Now()
+
+	// Enqueue is idempotent per session: the unique index on session_id makes a
+	// second enqueue of a completed recording an ErrConflict, which the
+	// scheduler treats as "already enqueued".
+	completed := func() domain.Session {
+		t.Helper()
+		return createManual(t, s, itRoomCode, domain.SessionCompleted, now.Add(-2*time.Hour), now.Add(-time.Hour))
+	}
+	sessionA, sessionB, sessionC, sessionD := completed(), completed(), completed(), completed()
+
+	mergeA, err := s.Merges.Enqueue(ctx, sessionA.ID)
+	if err != nil {
+		t.Fatalf("Enqueue(%s) error = %v", sessionA.ID, err)
+	}
+	if mergeA.ID == "" || mergeA.SessionID != sessionA.ID || mergeA.Status != domain.MergePending ||
+		mergeA.Attempts != 0 || mergeA.CreatedAt.IsZero() || mergeA.NextPollAt == nil {
+		t.Fatalf("enqueued merge = %+v", mergeA)
+	}
+	if mergeA.JobID != nil || mergeA.DestBucket != nil || mergeA.DestKey != nil ||
+		mergeA.SizeBytes != nil || mergeA.SHA256 != nil || mergeA.LastError != nil {
+		t.Fatalf("fresh merge carries resolution fields: %+v", mergeA)
+	}
+	requireConflict(t, func() error {
+		_, err := s.Merges.Enqueue(ctx, sessionA.ID)
+		return err
+	}(), "Enqueue(session that already has a merge)")
+	mergeB, err := s.Merges.Enqueue(ctx, sessionB.ID)
+	if err != nil {
+		t.Fatalf("Enqueue(%s) error = %v", sessionB.ID, err)
+	}
+	mergeC, err := s.Merges.Enqueue(ctx, sessionC.ID)
+	if err != nil {
+		t.Fatalf("Enqueue(%s) error = %v", sessionC.ID, err)
+	}
+	requireNotFound(t, func() error {
+		_, err := s.Merges.GetBySession(ctx, "missing-session")
+		return err
+	}(), "GetBySession(unknown)")
+
+	// Every pending row is due, so the first pass claims all three and dates
+	// the claim.
+	firstClaim := now.Add(time.Minute)
+	claimed, err := s.Merges.ClaimDue(ctx, firstClaim, 10)
+	if err != nil {
+		t.Fatalf("ClaimDue() error = %v", err)
+	}
+	if len(claimed) != 3 {
+		t.Fatalf("ClaimDue() returned %d merges, want the 3 pending ones", len(claimed))
+	}
+	claimedIDs := mergeIDSet(claimed)
+	for _, merge := range claimed {
+		if merge.Status != domain.MergePending || merge.Attempts != 0 {
+			t.Fatalf("claimed merge = %+v, want an untouched pending row", merge)
+		}
+	}
+	if !claimedIDs[mergeA.ID] || !claimedIDs[mergeB.ID] || !claimedIDs[mergeC.ID] {
+		t.Fatalf("ClaimDue() = %+v, want the three enqueued merges", claimed)
+	}
+	if leased, err := s.Merges.ClaimDue(ctx, firstClaim, 10); err != nil || len(leased) != 0 {
+		t.Fatalf("ClaimDue(before the lease expires) = %d merges, err %v; want none", len(leased), err)
+	}
+
+	// One pass per state: A is submitted for polling, B is deferred, C will be
+	// resolved below. Their next polls are pushed far enough out that the next
+	// claim can only pick up C.
+	nextClaim := now.Add(time.Hour)
+	if err := s.Merges.MarkSubmitted(ctx, mergeA.ID, "job-a", nextClaim.Add(3*time.Hour)); err != nil {
+		t.Fatalf("MarkSubmitted() error = %v", err)
+	}
+	submitted, err := s.Merges.GetBySession(ctx, sessionA.ID)
+	if err != nil {
+		t.Fatalf("GetBySession(submitted) error = %v", err)
+	}
+	if submitted.Status != domain.MergeSubmitted || submitted.JobID == nil || *submitted.JobID != "job-a" ||
+		submitted.NextPollAt == nil || !submitted.NextPollAt.Equal(nextClaim.Add(3*time.Hour).Truncate(time.Microsecond)) {
+		t.Fatalf("submitted merge = %+v", submitted)
+	}
+	if err := s.Merges.Defer(ctx, mergeB.ID, "source_unavailable", nextClaim.Add(2*time.Hour)); err != nil {
+		t.Fatalf("Defer() error = %v", err)
+	}
+	deferred, err := s.Merges.GetBySession(ctx, sessionB.ID)
+	if err != nil {
+		t.Fatalf("GetBySession(deferred) error = %v", err)
+	}
+	if deferred.Status != domain.MergePending || deferred.Attempts != 1 || deferred.LastError == nil ||
+		*deferred.LastError != "source_unavailable" || deferred.NextPollAt == nil ||
+		!deferred.NextPollAt.Equal(nextClaim.Add(2*time.Hour).Truncate(time.Microsecond)) {
+		t.Fatalf("deferred merge = %+v", deferred)
+	}
+	// A second defer counts the second attempt and clears the stale detail: a
+	// healthy retry is not an error.
+	if err := s.Merges.Defer(ctx, mergeB.ID, "", nextClaim.Add(3*time.Hour)); err != nil {
+		t.Fatalf("Defer(second) error = %v", err)
+	}
+	redeferred, err := s.Merges.GetBySession(ctx, sessionB.ID)
+	if err != nil || redeferred.Attempts != 2 || redeferred.LastError != nil ||
+		redeferred.NextPollAt == nil || !redeferred.NextPollAt.Equal(nextClaim.Add(3*time.Hour).Truncate(time.Microsecond)) {
+		t.Fatalf("twice-deferred merge = %+v, err %v", redeferred, err)
+	}
+
+	// Only C is due now: A and B were pushed past nextClaim, and the first
+	// claim's lease has expired for C.
+	secondClaim, err := s.Merges.ClaimDue(ctx, nextClaim, 10)
+	if err != nil {
+		t.Fatalf("ClaimDue(second) error = %v", err)
+	}
+	if len(secondClaim) != 1 || secondClaim[0].ID != mergeC.ID {
+		t.Fatalf("ClaimDue(second) = %+v, want only the still-due merge", secondClaim)
+	}
+
+	if err := s.Merges.MarkSucceeded(ctx, mergeC.ID, "recordings",
+		"merged/A301/2026-10-12/session-c.mp4", 10485760, "sha256-c"); err != nil {
+		t.Fatalf("MarkSucceeded() error = %v", err)
+	}
+	succeeded, err := s.Merges.GetBySession(ctx, sessionC.ID)
+	if err != nil {
+		t.Fatalf("GetBySession(succeeded) error = %v", err)
+	}
+	if succeeded.Status != domain.MergeSucceeded || succeeded.DestBucket == nil || *succeeded.DestBucket != "recordings" ||
+		succeeded.DestKey == nil || *succeeded.DestKey != "merged/A301/2026-10-12/session-c.mp4" ||
+		succeeded.SizeBytes == nil || *succeeded.SizeBytes != 10485760 ||
+		succeeded.SHA256 == nil || *succeeded.SHA256 != "sha256-c" {
+		t.Fatalf("succeeded merge = %+v", succeeded)
+	}
+
+	mergeD, err := s.Merges.Enqueue(ctx, sessionD.ID)
+	if err != nil {
+		t.Fatalf("Enqueue(%s) error = %v", sessionD.ID, err)
+	}
+	if err := s.Merges.MarkFailed(ctx, mergeD.ID, "codec vp9 cannot be merged"); err != nil {
+		t.Fatalf("MarkFailed() error = %v", err)
+	}
+	failed, err := s.Merges.GetBySession(ctx, sessionD.ID)
+	if err != nil {
+		t.Fatalf("GetBySession(failed) error = %v", err)
+	}
+	if failed.Status != domain.MergeFailed || failed.LastError == nil || *failed.LastError != "codec vp9 cannot be merged" {
+		t.Fatalf("failed merge = %+v", failed)
+	}
+
+	// Terminal rows never come back, while the submitted and deferred ones do
+	// once their next poll is due again.
+	lastClaim, err := s.Merges.ClaimDue(ctx, nextClaim.Add(6*time.Hour), 10)
+	if err != nil {
+		t.Fatalf("ClaimDue(terminal) error = %v", err)
+	}
+	lastIDs := mergeIDSet(lastClaim)
+	if len(lastClaim) != 2 || !lastIDs[mergeA.ID] || !lastIDs[mergeB.ID] {
+		t.Fatalf("ClaimDue(after resolution) = %+v, want the submitted and deferred merges only", lastClaim)
+	}
+
+	// The outcome methods reject an unknown id rather than silently updating
+	// nothing.
+	requireConflict(t, s.Merges.MarkFailed(ctx, "missing-merge", "detail"), "MarkFailed(unknown)")
+	requireConflict(t, s.Merges.Defer(ctx, "missing-merge", "", now), "Defer(unknown)")
+}
+
+func mergeIDSet(merges []domain.SessionMerge) map[string]bool {
+	set := make(map[string]bool, len(merges))
+	for _, merge := range merges {
+		set[merge.ID] = true
+	}
+	return set
+}

@@ -40,14 +40,27 @@ type TokenRefresher interface {
 	Refresh(ctx context.Context) (string, error)
 }
 
+// StreamMetadata is the encoder state webcam-server reports for a stream under
+// the metadata member. Codec is the codec the recorder settled on; Codecs the
+// ones the stream advertised, which is where a merge-client rejection such as a
+// vp8/vp9 recording is spotted before submit. Every field is optional so a
+// fixture without metadata still decodes.
+type StreamMetadata struct {
+	Resolution string   `json:"resolution,omitempty"`
+	FPS        int      `json:"fps,omitempty"`
+	Codec      string   `json:"codec,omitempty"`
+	Codecs     []string `json:"codecs,omitempty"`
+}
+
 // Stream is one recording stream of a device camera.
 type Stream struct {
-	ID         string     `json:"id"`
-	DeviceID   string     `json:"device_id"`
-	CameraEnum int        `json:"camera_enum"`
-	Status     string     `json:"status"` // active | completed | failed
-	StartedAt  time.Time  `json:"started_at"`
-	EndedAt    *time.Time `json:"ended_at,omitempty"`
+	ID         string         `json:"id"`
+	DeviceID   string         `json:"device_id"`
+	CameraEnum int            `json:"camera_enum"`
+	Status     string         `json:"status"` // active | completed | failed
+	StartedAt  time.Time      `json:"started_at"`
+	EndedAt    *time.Time     `json:"ended_at,omitempty"`
+	Metadata   StreamMetadata `json:"metadata"`
 }
 
 // Segment is one uploaded video chunk of a stream. DownloadURL is minted per

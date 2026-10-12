@@ -26,7 +26,7 @@
 //	GET    /api/v1/timetable/imports/{id}             fetch one import batch
 //	GET    /api/v1/sessions                           list recording sessions
 //	GET    /api/v1/sessions/{id}                      fetch one session
-//	GET    /api/v1/sessions/{id}/artifacts            list recorded segments and photos
+//	GET    /api/v1/sessions/{id}/artifacts            list recorded segments, photos and the merge job
 //	POST   /api/v1/sessions/{id}/recording/start      start a planned session
 //	POST   /api/v1/sessions/{id}/recording/stop       stop a session
 //	POST   /api/v1/rooms/{room_code}/recording/start  ad-hoc start
@@ -288,6 +288,17 @@ var (
 				"download_url": "https://files.example.edu/webcam/photos/01J8ZJ7PHO8T0W2Y4A6C8E0G2J4?X-Amz-Expires=900",
 			},
 		},
+		"merge": map[string]any{
+			"id":           "01J8ZM9MRG0S2U4W6Y8A0C2E4G6",
+			"session_id":   "01J8ZD2SES3N5Q7S9U1W3Y5A7C9",
+			"status":       "succeeded",
+			"job_id":       "01J8ZN1JOB2T4V6X8Z0B2D4F6H8",
+			"download_url": "https://files.example.edu/recordings/merged/A301/2026-09-07/01J8ZD2SES3N5Q7S9U1W3Y5A7C9.mp4?X-Amz-Expires=900",
+			"size_bytes":   104857600,
+			"attempts":     1,
+			"created_at":   "2026-09-07T01:40:11Z",
+			"updated_at":   "2026-09-07T01:52:30Z",
+		},
 	}
 	liveExample = map[string]any{
 		"online": true,
@@ -546,7 +557,7 @@ var DocOperations = []apidocs.Operation{
 		Path:            "/api/v1/sessions/{id}/artifacts",
 		Tag:             "Sessions",
 		Summary:         "List session artifacts",
-		Description:     "Use to enumerate a session's recorded segments and resolved photos. Segments are re-derived from GET /api/streams/{stream_id}/ on webcam-server and photos are resolved through the session's photo ledger; every download_url is minted by webcam-server for this response, is valid for about 15 minutes and is never cached by dispatchub, so request the artifacts again when a URL expires. A session without a stored stream_id reports its own status with empty lists, and an unreachable webcam-server answers 503 upstream_unavailable.",
+		Description:     "Use to enumerate a session's recorded segments and resolved photos. Segments are re-derived from GET /api/streams/{stream_id}/ on webcam-server and photos are resolved through the session's photo ledger; every download_url is minted by webcam-server for this response, is valid for about 15 minutes and is never cached by dispatchub, so request the artifacts again when a URL expires. A session without a stored stream_id reports its own status with empty lists, and an unreachable webcam-server answers 503 upstream_unavailable. The optional merge member is the session's merge job in smartclass-merge, which remuxes the segments into one playable video: status is pending until the job is submitted, submitted while it is polled, then succeeded or failed. On the succeeded member download_url is minted per response by filehouse - the service that owns the destination bucket - and is valid for about 15 minutes; dispatchub never caches it, so request the artifacts again when it expires. The URL is absent while the merge is not succeeded and while filehouse could not mint it (the member still reports the merge's state, and the failure is logged, never a 5xx). The object-storage coordinates that locate the merged video are never exposed: they stay in dispatchub's database, where download_url minting reads them. The member is absent while no merge was ever enqueued, which is also the case when merging is disabled; a failed ledger lookup is logged and leaves the member out instead of failing the call.",
 		Security:        "bearerAuth",
 		PermissionNote:  permissionNoteSession,
 		Response:        artifactsResponse{},
